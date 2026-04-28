@@ -127,22 +127,23 @@ def main():
 
         input_data_list.append(cur_calib_data)
         output_data_list.append(out_data)
-        # save samples
+
+        # Save calib tensors before optional sample export, so a video codec error
+        # does not destroy the main artifact produced by this script.
+        torch.save(calib_data, os.path.join(save_dir, "calib_data.pt"))
+        if cfg.save_inp_oup:
+            torch.save(input_data_list, os.path.join(save_dir, "input_list.pt"))
+            torch.save(output_data_list, os.path.join(save_dir, "output_list.pt"))
+
         samples = vae.decode(samples.to(dtype))
-        # if coordinator.is_master():
         for idx, sample in enumerate(samples):
             print(f"Prompt: {batch_prompts[idx]}")
             save_path = os.path.join(save_dir, f"sample_{sample_idx}")
-            save_sample(sample, fps=cfg.fps, save_path=save_path)
+            try:
+                save_sample(sample, fps=cfg.fps, save_path=save_path)
+            except Exception as e:
+                print(f"Failed to save sample to {save_path}.mp4: {e}")
             sample_idx += 1
-
-    # ======================================================
-    # 5. save calibration data
-    # ======================================================
-    torch.save(calib_data, os.path.join(save_dir, "calib_data.pt"))
-    if cfg.save_inp_oup:
-        torch.save(input_data_list, os.path.join(save_dir, "input_list.pt"))
-        torch.save(output_data_list, os.path.join(save_dir, "output_list.pt"))
 
 
 if __name__ == "__main__":

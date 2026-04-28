@@ -7,7 +7,7 @@ model = dict(
     type="STDiT-XL/2",
     space_scale=1.0,
     time_scale=1.0,
-    enable_flashattn=False, # default is True
+    enable_flashattn=True, # default is True
     enable_layernorm_kernel=False, # default is True
     from_pretrained="PRETRAINED_MODEL"
 )
@@ -28,7 +28,7 @@ scheduler = dict(
     num_sampling_steps=100,
     cfg_scale=4.0,
 )
-dtype = "fp32"
+dtype = "fp16"
 
 # Others
 batch_size = 1
