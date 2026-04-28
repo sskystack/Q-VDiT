@@ -13,14 +13,14 @@ model = dict(
 )
 vae = dict(
     type="VideoAutoencoderKL",
-    from_pretrained="/data/qvdit/logs/vae_ckpt",
+    from_pretrained="/root/autodl-tmp/vae_ckpt/vae_ckpt",
     micro_batch_size=128,
 )
 text_encoder = dict(
     type="t5",
-    from_pretrained="/data/qvdit/logs",
-    local_cache=True,
-    save_pretrained="/data/qvdit/logs/t5-v1_1-xxl",
+    from_pretrained="t5-v1_1-xxl",
+    local_cache=False,
+    save_pretrained="/root/autodl-tmp/t5-v1_1-xxl",
     model_max_length=120,
 )
 scheduler = dict(
@@ -33,5 +33,5 @@ dtype = "fp32"
 # Others
 batch_size = 1
 seed = 42
-prompt_path = "/data/qvdit/t2v/assets/texts/t2v_samples.txt"
+prompt_path = "/root/Q-VDiT/t2v/assets/texts/t2v_samples.txt"
 # save_dir = "./generated_videos/fp16"
