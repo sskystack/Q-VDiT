@@ -13,7 +13,7 @@ model = dict(
 )
 vae = dict(
     type="VideoAutoencoderKL",
-    from_pretrained="/data/qvdit/logs/vae_ckpt",
+    from_pretrained="stabilityai/sd-vae-ft-ema",
     micro_batch_size=128,
 )
 text_encoder = dict(
@@ -24,7 +24,7 @@ text_encoder = dict(
 )
 scheduler = dict(
     type="iddpm",
-    num_sampling_steps=20,
+    num_sampling_steps=100,
     cfg_scale=7.0,
 )
 dtype = "fp16"
@@ -32,6 +32,6 @@ dtype = "fp16"
 # Others
 batch_size = 1
 seed = 42
-prompt_path = "/data/qvdit/t2v/assets/texts/t2v_samples.txt"
+prompt_path = "./t2v/assets/texts/t2v_samples_10.txt"
 # save_dir = "./generated_videos/fp16"
 

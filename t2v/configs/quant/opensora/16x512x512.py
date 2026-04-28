@@ -7,7 +7,7 @@ model = dict(
     type="STDiT-XL/2",
     space_scale=1.0,
     time_scale=1.0,
-    enable_flashattn=False, # default is True
+    enable_flashattn=True, # default is True
     enable_layernorm_kernel=False, # default is True
     from_pretrained="PRETRAINED_MODEL"
 )
@@ -35,4 +35,3 @@ batch_size = 1
 seed = 42
 prompt_path = "/data/qvdit/t2v/assets/texts/t2v_samples.txt"
 # save_dir = "./generated_videos/fp16"
-
