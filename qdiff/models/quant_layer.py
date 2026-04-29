@@ -104,6 +104,29 @@ class QuantLayer(nn.Module):
             # assert self.timerange_num == len(self.smooth_quant_alpha)
             self.smooth_quant_running_stat = False
 
+    def _module_tag(self):
+        return getattr(self, "module_name", self.__class__.__name__)
+
+    def _log_dtype_alignment(self, input, weight, bias=None, extra=None):
+        payload = {
+            "input": str(input.dtype),
+            "weight": str(weight.dtype),
+            "bias": "None" if bias is None else str(bias.dtype),
+            "shape": tuple(input.shape),
+        }
+        if extra:
+            payload.update(extra)
+        logger.info("%s dtype alignment: %s", self._module_tag(), payload)
+
+    def _align_tensor_dtypes(self, input, weight, bias=None, extra=None):
+        if weight.dtype != input.dtype or (bias is not None and bias.dtype != input.dtype):
+            self._log_dtype_alignment(input, weight, bias, extra=extra)
+        if weight.dtype != input.dtype:
+            weight = weight.to(input.dtype)
+        if bias is not None and bias.dtype != input.dtype:
+            bias = bias.to(input.dtype)
+        return weight, bias
+
     def forward(self, input: torch.Tensor, scale: float = 1.0, split: int = 0, smooth_quant_enable: bool = False):
         # DEBUG_ONLY: test the time of init
         if split != 0 and self.split != 0:
@@ -204,11 +227,13 @@ class QuantLayer(nn.Module):
             bias = self.bias
 
 
-        if weight.dtype == torch.float32 and input.dtype == torch.float16:
-            weight = weight.to(torch.float16)
+        weight, bias = self._align_tensor_dtypes(input, weight, bias)
 
-
-        out = self.fwd_func(input, weight, bias, **self.fwd_kwargs)  # 在输出的channel上进行channel_wise的量化
+        try:
+            out = self.fwd_func(input, weight, bias, **self.fwd_kwargs)  # 在输出的channel上进行channel_wise的量化
+        except RuntimeError:
+            self._log_dtype_alignment(input, weight, bias)
+            raise
         out = self.activation_function(out)
 
         if torch.isnan(out).any():

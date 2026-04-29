@@ -110,11 +110,14 @@ class QuantSpatialAttnLinear(QuantLayer):
                 weight = self.weight
             bias = self.bias
 
-        if weight.dtype == torch.float32 and input.dtype == torch.float16:
-            weight = weight.to(torch.float16)
+        weight, bias = self._align_tensor_dtypes(input, weight, bias)
 
         # import ipdb; ipdb.set_trace()
-        out = self.fwd_func(input, weight, bias, **self.fwd_kwargs)
+        try:
+            out = self.fwd_func(input, weight, bias, **self.fwd_kwargs)
+        except RuntimeError:
+            self._log_dtype_alignment(input, weight, bias)
+            raise
         out = self.activation_function(out)
 
         if torch.isnan(out).any():
@@ -220,15 +223,49 @@ class QuantTemporalAttnLinear(QuantLayer):
                 weight = self.weight
             bias = self.bias
 
-        if weight.dtype == torch.float32 and input.dtype == torch.float16:
-            weight = weight.to(torch.float16)
+        extra = None
+        if self.weight_quant:
+            extra = {
+                "lora_weight_out": str(lora_weight_out.dtype),
+                "mask": str(self.mask.dtype),
+            }
+        weight, bias = self._align_tensor_dtypes(input, weight, bias, extra=extra)
 
-        out = self.fwd_func(input, weight, bias, **self.fwd_kwargs)
+        try:
+            out = self.fwd_func(input, weight, bias, **self.fwd_kwargs)
+        except RuntimeError:
+            self._log_dtype_alignment(input, weight, bias, extra=extra)
+            raise
         if self.weight_quant:
             if lora_weight_out.dtype != input.dtype:
+                self._log_dtype_alignment(
+                    input,
+                    weight,
+                    bias,
+                    extra={
+                        "lora_weight_out": str(lora_weight_out.dtype),
+                        "mask": str(self.mask.dtype),
+                        "event": "align_lora_weight_out",
+                    },
+                )
                 lora_weight_out = lora_weight_out.to(input.dtype)
             out_lora = self.fwd_func(input, lora_weight_out, **self.fwd_kwargs)
-            out_lora = out_lora * self.mask
+            if self.mask.dtype != out_lora.dtype:
+                self._log_dtype_alignment(
+                    input,
+                    weight,
+                    bias,
+                    extra={
+                        "lora_weight_out": str(lora_weight_out.dtype),
+                        "mask": str(self.mask.dtype),
+                        "out_lora": str(out_lora.dtype),
+                        "event": "align_mask",
+                    },
+                )
+                mask = self.mask.to(out_lora.dtype)
+            else:
+                mask = self.mask
+            out_lora = out_lora * mask
             out = out + out_lora
         out = self.activation_function(out)
 
@@ -359,10 +396,13 @@ class QuantCrossAttnLinear(QuantLayer):
                 weight = self.weight
             bias = self.bias
 
-        if weight.dtype == torch.float32 and input.dtype == torch.float16:
-            weight = weight.to(torch.float16)
+        weight, bias = self._align_tensor_dtypes(input, weight, bias)
 
-        out = self.fwd_func(input, weight, bias, **self.fwd_kwargs)
+        try:
+            out = self.fwd_func(input, weight, bias, **self.fwd_kwargs)
+        except RuntimeError:
+            self._log_dtype_alignment(input, weight, bias)
+            raise
         out = self.activation_function(out)
 
         if torch.isnan(out).any():
@@ -370,4 +410,3 @@ class QuantCrossAttnLinear(QuantLayer):
             import ipdb; ipdb.set_trace()
 
         return out
-

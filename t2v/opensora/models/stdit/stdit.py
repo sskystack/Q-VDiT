@@ -1,3 +1,4 @@
+import logging
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -31,6 +32,8 @@ from opensora.models.layers.blocks import (
 )
 from opensora.registry import MODELS
 from opensora.utils.ckpt_utils import load_checkpoint
+
+logger = logging.getLogger(__name__)
 
 
 class STDiTBlock(nn.Module):
@@ -301,6 +304,7 @@ class STDiT(nn.Module):
 
         # blocks
         for i, block in enumerate(self.blocks):
+            logger.info(f"running block {i}")
             if i == 0:
                 if self.enable_sequence_parallelism:
                     tpe = torch.chunk(

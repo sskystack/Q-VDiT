@@ -159,14 +159,15 @@ class Attention(nn.Module):
         else:
             qkv = self.qkv(x)
         qkv_shape = (B, N, 3, self.num_heads, self.head_dim)
-        if self.enable_flashattn:
+        use_flashattn = self.enable_flashattn and qkv.dtype in (torch.float16, torch.bfloat16)
+        if use_flashattn:
             qkv_permute_shape = (2, 0, 1, 3, 4)
         else:
             qkv_permute_shape = (2, 0, 3, 1, 4)
         qkv = qkv.view(qkv_shape).permute(qkv_permute_shape)
         q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)
-        if self.enable_flashattn:
+        if use_flashattn:
             from flash_attn import flash_attn_func
 
             x = flash_attn_func(
@@ -187,7 +188,7 @@ class Attention(nn.Module):
             x = attn @ v
 
         x_output_shape = (B, N, C)
-        if not self.enable_flashattn:
+        if not use_flashattn:
             x = x.transpose(1, 2)
         x = x.reshape(x_output_shape)
         x = self.proj(x)
@@ -231,7 +232,8 @@ class SeqParallelAttention(Attention):
         # [B, SUB_N, 3, NUM_HEAD, HEAD_DIM] -> [B, N, 3, NUM_HEAD_PER_DEVICE, HEAD_DIM]
         qkv = all_to_all(qkv, sp_group, scatter_dim=3, gather_dim=1)
 
-        if self.enable_flashattn:
+        use_flashattn = self.enable_flashattn and qkv.dtype in (torch.float16, torch.bfloat16)
+        if use_flashattn:
             qkv_permute_shape = (2, 0, 1, 3, 4)  # [3, B, N, NUM_HEAD_PER_DEVICE, HEAD_DIM]
         else:
             qkv_permute_shape = (2, 0, 3, 1, 4)  # [3, B, NUM_HEAD_PER_DEVICE, N, HEAD_DIM]
@@ -239,7 +241,7 @@ class SeqParallelAttention(Attention):
 
         q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)
-        if self.enable_flashattn:
+        if use_flashattn:
             from flash_attn import flash_attn_func
 
             x = flash_attn_func(
@@ -259,7 +261,7 @@ class SeqParallelAttention(Attention):
             attn = self.attn_drop(attn)
             x = attn @ v
 
-        if not self.enable_flashattn:
+        if not use_flashattn:
             x = x.transpose(1, 2)
 
         # apply all to all to gather back attention heads and split sequence
