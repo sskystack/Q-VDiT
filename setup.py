@@ -33,8 +33,8 @@ setup(
     version="1.0.0",
     packages=find_packages(
         include=(
-            # "t2v.*",
             "qdiff",
+            "qdiff.*",
         ),
     ),
     description="Democratizing Efficient Video Production for All",

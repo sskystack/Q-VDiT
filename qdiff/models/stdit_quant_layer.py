@@ -225,6 +225,8 @@ class QuantTemporalAttnLinear(QuantLayer):
 
         out = self.fwd_func(input, weight, bias, **self.fwd_kwargs)
         if self.weight_quant:
+            if lora_weight_out.dtype != input.dtype:
+                lora_weight_out = lora_weight_out.to(input.dtype)
             out_lora = self.fwd_func(input, lora_weight_out, **self.fwd_kwargs)
             out_lora = out_lora * self.mask
             out = out + out_lora
@@ -368,5 +370,4 @@ class QuantCrossAttnLinear(QuantLayer):
             import ipdb; ipdb.set_trace()
 
         return out
-
 
