@@ -13,13 +13,13 @@ model = dict(
 )
 vae = dict(
     type="VideoAutoencoderKL",
-    from_pretrained="/data/qvdit/logs/vae_ckpt",
+    from_pretrained="/root/data-fs/models/stabilityai/sd-vae-ft-ema",
     micro_batch_size=128,
 )
 text_encoder = dict(
     type="t5",
-    from_pretrained="/data/qvdit/pretrained_models/t5_ckpts",
-    save_pretrained="/data/qvdit/checkpoints/text_encoder/pretrained_t5",
+    from_pretrained="/root/data-fs/models/DeepFloyd",
+    save_pretrained="/root/data-fs/models/DeepFloyd/t5-v1_1-xxl",
     model_max_length=120,
 )
 scheduler = dict(
@@ -34,4 +34,3 @@ batch_size = 4
 seed = 42
 prompt_path = "./assets/texts/t2v_samples.txt"
 # save_dir = "./generated_videos/fp16"
-
