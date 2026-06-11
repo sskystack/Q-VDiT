@@ -19,7 +19,9 @@ def parse_args(training=False, mode=None):
     parser.add_argument("--batch_size", default=None, type=int, help="batch size")
     parser.add_argument("--gpu", type=str, default="0", help="GPU device")
     parser.add_argument("--outdir", default=None, required=True, type=str, help="path to write results to")
+    parser.add_argument("--dtype", default=None, type=str, choices=["fp16", "bf16", "fp32"], help="model dtype")
     parser.add_argument("--precompute_text_embeds", default=None, type=str, help="path to load the precomputed text_embeds")
+    parser.add_argument("--data_parallel", action="store_true", help="shard prompts across torchrun ranks")
 
     # ======================================================
     # Inference
@@ -29,6 +31,7 @@ def parse_args(training=False, mode=None):
         # prompt
         parser.add_argument("--prompt_path", default=None, type=str, help="path to prompt txt file")
         parser.add_argument("--save_dir", default=None, type=str, help="path to save generated samples, if leave empty, is outdir/generated_videos")
+        parser.add_argument("--prompt_as_path", action="store_true", help="use prompt text as output filename")
         # hyperparameters
         parser.add_argument("--num_sampling_steps", default=None, type=int, help="sampling steps")
         parser.add_argument("--cfg_scale", default=None, type=float, help="balance between cond & uncond")

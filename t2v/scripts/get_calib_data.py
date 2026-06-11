@@ -21,6 +21,20 @@ def load_prompts(prompt_path):
     return prompts
 
 
+def move_tensors_to_device(obj, device, dtype=None):
+    if torch.is_tensor(obj):
+        if dtype is not None and torch.is_floating_point(obj):
+            return obj.to(device=device, dtype=dtype)
+        return obj.to(device)
+    if isinstance(obj, dict):
+        return {key: move_tensors_to_device(value, device, dtype) for key, value in obj.items()}
+    if isinstance(obj, list):
+        return [move_tensors_to_device(value, device, dtype) for value in obj]
+    if isinstance(obj, tuple):
+        return tuple(move_tensors_to_device(value, device, dtype) for value in obj)
+    return obj
+
+
 def main():
     # ======================================================
     # 1. cfg and init distributed env
@@ -102,7 +116,11 @@ def main():
     input_data_list = []
     output_data_list = []
     if PRECOMPUTE_TEXT_EMBEDS is not None:
-        model_args['precompute_text_embeds'] = torch.load(cfg.precompute_text_embeds)
+        model_args['precompute_text_embeds'] = move_tensors_to_device(
+            torch.load(cfg.precompute_text_embeds, map_location="cpu"),
+            device,
+            dtype,
+        )
 
     for i in range(0, len(prompts), cfg.batch_size):
         batch_prompts = prompts[i : i + cfg.batch_size]

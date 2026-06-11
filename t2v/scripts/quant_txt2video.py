@@ -5,10 +5,14 @@ import sys
 import torch
 import shutil
 import logging
+import colossalai
+import torch.distributed as dist
+from colossalai.cluster import DistCoordinator
 from omegaconf import OmegaConf
 from mmengine.runner import set_random_seed
 import yaml
 
+from opensora.acceleration.parallel_states import set_sequence_parallel_group
 from opensora.datasets import save_sample
 from opensora.registry import MODELS, SCHEDULERS, build_module
 from opensora.utils.config_utils import parse_configs
@@ -25,6 +29,37 @@ def load_prompts(prompt_path):
     with open(prompt_path, "r") as f:
         prompts = [line.strip() for line in f.readlines()]
     return prompts
+
+
+def move_tensors_to_device(obj, device, dtype=None):
+    if torch.is_tensor(obj):
+        if dtype is not None and torch.is_floating_point(obj):
+            return obj.to(device=device, dtype=dtype)
+        return obj.to(device)
+    if isinstance(obj, dict):
+        return {key: move_tensors_to_device(value, device, dtype) for key, value in obj.items()}
+    if isinstance(obj, list):
+        return [move_tensors_to_device(value, device, dtype) for value in obj]
+    if isinstance(obj, tuple):
+        return tuple(move_tensors_to_device(value, device, dtype) for value in obj)
+    return obj
+
+
+def init_parallel(data_parallel=False):
+    if "WORLD_SIZE" not in os.environ or int(os.environ.get("WORLD_SIZE", "1")) <= 1:
+        return False, 0, 1
+
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    rank = int(os.environ.get("RANK", local_rank))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+    if data_parallel:
+        return False, rank, world_size
+    colossalai.launch_from_torch({})
+    coordinator = DistCoordinator()
+    set_sequence_parallel_group(dist.group.WORLD)
+    return True, coordinator.rank, coordinator.world_size
 
 
 def main():
@@ -68,15 +103,25 @@ def main():
     torch.set_grad_enabled(False)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
+    data_parallel = cfg.get("data_parallel", False)
+    enable_sequence_parallelism, rank, world_size = init_parallel(data_parallel=data_parallel)
     device = f"cuda" if torch.cuda.is_available() else "cpu"
-    gpus = [int(d) for d in cfg.gpu.split(",")]
-    torch.cuda.set_device(gpus[0])
+    if not enable_sequence_parallelism:
+        gpus = [int(d) for d in cfg.gpu.split(",")]
+        torch.cuda.set_device(gpus[0])
     dtype = to_torch_dtype(cfg.dtype)
     print(dtype)
     
     set_random_seed(seed=cfg.seed)
     prompts = load_prompts(cfg.prompt_path)
     prompts = prompts[:cfg.num_videos]
+    global_start_idx = 0
+    if data_parallel and world_size > 1:
+        total_prompts = len(prompts)
+        shard_start = total_prompts * rank // world_size
+        shard_end = total_prompts * (rank + 1) // world_size
+        prompts = prompts[shard_start:shard_end]
+        global_start_idx = shard_start
 
     # ======================================================
     # 3. build model & load weights
@@ -96,7 +141,7 @@ def main():
         caption_channels=4096,  # DIRTY: for T5 only
         model_max_length=cfg.text_encoder.model_max_length,
         dtype=dtype,
-        enable_sequence_parallelism=False,
+        enable_sequence_parallelism=enable_sequence_parallelism,
     )
     if PRECOMPUTE_TEXT_EMBEDS is not None:
         text_encoder = None
@@ -223,16 +268,20 @@ def main():
     # 5. inference
     # ======================================================
     qnn.timestep_wise_quant =False
-    sample_idx = 0
+    sample_idx = global_start_idx
     save_dir = opt.save_dir
     os.makedirs(save_dir, exist_ok=True)
     if PRECOMPUTE_TEXT_EMBEDS is not None:
-        model_args['precompute_text_embeds'] = torch.load(cfg.precompute_text_embeds)
+        model_args['precompute_text_embeds'] = move_tensors_to_device(
+            torch.load(cfg.precompute_text_embeds, map_location="cpu"),
+            device,
+            dtype,
+        )
     print(cfg.batch_size)
     for i in range(0, len(prompts), cfg.batch_size):
         batch_prompts = prompts[i : i + cfg.batch_size]
         if PRECOMPUTE_TEXT_EMBEDS is not None:  # also feed in the idxs for saved text_embeds
-            model_args['batch_ids'] = torch.arange(i,i+cfg.batch_size)
+            model_args['batch_ids'] = torch.arange(global_start_idx + i, global_start_idx + i + len(batch_prompts))
         samples = scheduler.sample(
             qnn,
             text_encoder,
@@ -245,10 +294,13 @@ def main():
         samples = vae.decode(samples.to(dtype))
 
         for idx, sample in enumerate(samples):
-            print(f"Prompt: {batch_prompts[idx]}")
-            save_path = os.path.join(save_dir, f"sample_{sample_idx}")
-            # save_path = os.path.join(save_dir, f"{batch_prompts[idx]}-0")
-            save_sample(sample, fps=cfg.fps, save_path=save_path)
+            if data_parallel or rank == 0:
+                print(f"Prompt: {batch_prompts[idx]}")
+                if cfg.get("prompt_as_path", False):
+                    save_path = os.path.join(save_dir, batch_prompts[idx])
+                else:
+                    save_path = os.path.join(save_dir, f"sample_{sample_idx}")
+                save_sample(sample, fps=cfg.fps, save_path=save_path)
             sample_idx += 1
 
 

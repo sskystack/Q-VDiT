@@ -206,6 +206,7 @@ class SeqParallelAttention(Attention):
         proj_drop: float = 0.0,
         norm_layer: nn.Module = nn.LayerNorm,
         enable_flashattn: bool = False,
+        separate_qkv: bool = True,
     ) -> None:
         super().__init__(
             dim=dim,
@@ -216,11 +217,18 @@ class SeqParallelAttention(Attention):
             proj_drop=proj_drop,
             norm_layer=norm_layer,
             enable_flashattn=enable_flashattn,
+            separate_qkv=separate_qkv,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, N, C = x.shape  # for sequence parallel here, the N is a local sequence length
-        qkv = self.qkv(x)
+        if self.separate_qkv:
+            q = self.q(x).unsqueeze(2)
+            k = self.k(x).unsqueeze(2)
+            v = self.v(x).unsqueeze(2)
+            qkv = torch.cat([q, k, v], dim=2)
+        else:
+            qkv = self.qkv(x)
         qkv_shape = (B, N, 3, self.num_heads, self.head_dim)
 
         qkv = qkv.view(qkv_shape)

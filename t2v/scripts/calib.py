@@ -10,7 +10,6 @@ from omegaconf import OmegaConf
 import torch
 import shutil
 from mmengine.runner import set_random_seed
-from pytorch_lightning import seed_everything
 
 from opensora.registry import MODELS, SCHEDULERS, build_module
 from opensora.utils.config_utils import parse_configs
