@@ -8,9 +8,13 @@ import numpy as np
 from tqdm import tqdm, trange
 from omegaconf import OmegaConf
 import torch
+import torch.distributed as dist
+import colossalai
+from colossalai.cluster import DistCoordinator
 import shutil
 from mmengine.runner import set_random_seed
 
+from opensora.acceleration.parallel_states import set_sequence_parallel_group
 from opensora.registry import MODELS, SCHEDULERS, build_module
 from opensora.utils.config_utils import parse_configs
 from opensora.utils.build_model import build_models
@@ -23,6 +27,20 @@ from qdiff.optimization.model_recon import our_model_reconstruction
 
 logger = logging.getLogger(__name__)
 # os.environ["CUDA_LAUNCH_BLOCKING"]="1"
+
+
+def init_sequence_parallel_if_needed():
+    if "WORLD_SIZE" not in os.environ or int(os.environ.get("WORLD_SIZE", "1")) <= 1:
+        return False, 0, 1
+
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    torch.cuda.set_device(local_rank)
+    colossalai.launch_from_torch({})
+    coordinator = DistCoordinator()
+    set_sequence_parallel_group(dist.group.WORLD)
+    return True, coordinator.rank, coordinator.world_size
+
+
 def main():
 
     # ======================================================
@@ -31,21 +49,25 @@ def main():
     cfg = parse_configs(training=False, mode="ptq")
     print(cfg)
     PRECOMPUTE_TEXT_EMBEDS = cfg.get('precompute_text_embeds', None)
+    enable_sequence_parallelism, rank, world_size = init_sequence_parallel_if_needed()
 
     opt = cfg
     os.makedirs(opt.outdir, exist_ok=True)
     outpath = opt.outdir
 
     # INFO: add bakup file and bakup cfg into logpath for debug
-    if os.path.exists(os.path.join(outpath,'config.yaml')):
-        os.remove(os.path.join(outpath,'config.yaml'))
-    shutil.copy(opt.calib_config, os.path.join(outpath,'config.yaml'))
-    shutil.copy(opt.config, os.path.join(outpath,'opensora_config.py'))
-    if os.path.exists(os.path.join(outpath,'qdiff')): # if exist, overwrite
-        shutil.rmtree(os.path.join(outpath,'qdiff'))
-    shutil.copytree('./qdiff', os.path.join(outpath,'qdiff'))
+    if rank == 0:
+        if os.path.exists(os.path.join(outpath,'config.yaml')):
+            os.remove(os.path.join(outpath,'config.yaml'))
+        shutil.copy(opt.calib_config, os.path.join(outpath,'config.yaml'))
+        shutil.copy(opt.config, os.path.join(outpath,'opensora_config.py'))
+        if os.path.exists(os.path.join(outpath,'qdiff')): # if exist, overwrite
+            shutil.rmtree(os.path.join(outpath,'qdiff'))
+        shutil.copytree('./qdiff', os.path.join(outpath,'qdiff'))
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
 
-    log_path = os.path.join(outpath, "run.log")
+    log_path = os.path.join(outpath, "run.log" if rank == 0 else f"run_rank{rank}.log")
     logging.basicConfig(
         format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
         datefmt='%m/%d/%Y %H:%M:%S',
@@ -66,8 +88,9 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     device = f"cuda" if torch.cuda.is_available() else "cpu"
-    gpus = [int(d) for d in cfg.gpu.split(",")]
-    torch.cuda.set_device(gpus[0])
+    if not enable_sequence_parallelism:
+        gpus = [int(d) for d in cfg.gpu.split(",")]
+        torch.cuda.set_device(gpus[0])
     
     dtype = to_torch_dtype(cfg.dtype)
     set_random_seed(seed=cfg.seed)
@@ -89,7 +112,7 @@ def main():
         caption_channels=4096,  # DIRTY: for T5 only
         model_max_length=cfg.text_encoder.model_max_length,
         dtype=dtype,
-        enable_sequence_parallelism=False,
+        enable_sequence_parallelism=enable_sequence_parallelism,
     )
     if PRECOMPUTE_TEXT_EMBEDS is not None:
         text_encoder = None
