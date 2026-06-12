@@ -457,4 +457,8 @@ def main():
     torch.save(quant_params_dict, os.path.join(outpath, "ckpt.pth"))
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        logging.exception("calib.py failed")
+        raise
