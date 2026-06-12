@@ -5,7 +5,16 @@ from qdiff.models.quant_layer import QuantLayer, find_interval
 from omegaconf import ListConfig
 import copy
 import torch.nn as nn
+import torch.distributed as dist
+from opensora.acceleration.parallel_states import get_sequence_parallel_group
 logger = logging.getLogger(__name__)
+
+
+def get_sp_rank_size():
+    group = get_sequence_parallel_group()
+    if dist.is_available() and dist.is_initialized() and group is not None:
+        return dist.get_rank(group), dist.get_world_size(group)
+    return 0, 1
 
 '''
 Utility QuantLayers for STDiT temporal/spatial attn layer linears
@@ -27,6 +36,10 @@ class QuantSpatialAttnLinear(QuantLayer):
         S = self.act_quant_params['n_spatial_token']
         C = input.shape[2]
         assert input.shape[1] == S
+        _, sp_size = get_sp_rank_size()
+        if sp_size > 1:
+            T = T // sp_size
+            BS = input.shape[0] // T
 
         if self.smooth_quant:
             cur_timerange_id = find_interval(self.timerange, self.cur_timestep_id)
@@ -136,6 +149,9 @@ class QuantTemporalAttnLinear(QuantLayer):
         T = self.act_quant_params['n_temporal_token']
         S = self.act_quant_params['n_spatial_token']
         C = input.shape[2]
+        sp_rank, sp_size = get_sp_rank_size()
+        if sp_size > 1:
+            T = T // sp_size
         assert input.shape[1] == T
 
         if self.smooth_quant:
@@ -226,7 +242,11 @@ class QuantTemporalAttnLinear(QuantLayer):
         out = self.fwd_func(input, weight, bias, **self.fwd_kwargs)
         if self.weight_quant:
             out_lora = self.fwd_func(input, lora_weight_out, **self.fwd_kwargs)
-            out_lora = out_lora * self.mask
+            if sp_size > 1:
+                mask = self.mask[:, sp_rank * T : (sp_rank + 1) * T, :]
+            else:
+                mask = self.mask
+            out_lora = out_lora * mask
             out = out + out_lora
         out = self.activation_function(out)
 
@@ -368,5 +388,4 @@ class QuantCrossAttnLinear(QuantLayer):
             import ipdb; ipdb.set_trace()
 
         return out
-
 
