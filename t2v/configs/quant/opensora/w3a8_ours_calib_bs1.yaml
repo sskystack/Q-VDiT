@@ -9,6 +9,7 @@ calib_data:
   n_steps: 100
   batch_size: 2
   n_samples: 10
+  keep_cache_on_cpu: true
 quant:
   weight:
     optimization:

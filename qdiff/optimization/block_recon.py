@@ -32,6 +32,10 @@ def mv_to_gpu(l_x, device='cuda'):
     return l_x
 
 
+def index_to_device(x, idx, device):
+    return x[idx].to(device)
+
+
 def block_reconstruction(model: QuantModel, block: BaseQuantBlock, calib_data: torch.Tensor, config, param_types, opt_target):
                          # batch_size: int = 32, iters: int = 20000, weight: float = 0.01, opt_mode: str = 'mse',
                          # asym: bool = False, include_act_func: bool = True, b_range: tuple = (20, 2),
@@ -262,14 +266,14 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock, calib_data: t
             # 这个对应多输入
             if len(cached_inps)==2:
                 # idx = torch.randperm(cached_inps[0].size(0))[:batch_size]
-                cur_x = cached_inps[0][idx]
-                cur_t = cached_inps[1][idx]
+                cur_x = index_to_device(cached_inps[0], idx, device)
+                cur_t = index_to_device(cached_inps[1], idx, device)
                 cur_inp = (cur_x, cur_t)
             elif len(cached_inps)==3:
                 # idx = torch.randperm(cached_inps[0].size(0))[:batch_size]
-                cur_x = cached_inps[0][idx]
-                cur_t = cached_inps[1][idx]
-                cur_y = cached_inps[2][idx]
+                cur_x = index_to_device(cached_inps[0], idx, device)
+                cur_t = index_to_device(cached_inps[1], idx, device)
+                cur_y = index_to_device(cached_inps[2], idx, device)
                 cur_inp = (cur_x, cur_t, cur_y)
             else:
                 # 针对 QuantTransformerBlock
@@ -296,12 +300,12 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock, calib_data: t
                 cur_inp = tuple(cur_inp)
         else:
             # idx = torch.randperm(cached_inps.size(0))[:batch_size]  # 随机取样
-            cur_inp = cached_inps[idx]
+            cur_inp = index_to_device(cached_inps, idx, device)
         if isinstance(cached_outs, list):
             # cur_out = cached_outs[pmp_id][idx]
             cur_out = torch.cat([cached_outs[pmp_id][index] for index in [idx*4, idx*4+1, idx*4+2, idx*4+3]])
         else:
-            cur_out = cached_outs[idx]
+            cur_out = index_to_device(cached_outs, idx, device)
         cur_grad = cached_grads[idx] if use_grad else None
 
         # import ipdb; ipdb.set_trace()
