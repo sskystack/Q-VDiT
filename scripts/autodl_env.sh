@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-export QVDIT_AUTODL_ROOT="${QVDIT_AUTODL_ROOT:-/root/autodl-tmp}"
+export QVDIT_AUTODL_ROOT="${QVDIT_AUTODL_ROOT:-/home/zhouchongtian/quantization}"
 export TMPDIR="${TMPDIR:-$QVDIT_AUTODL_ROOT/cache/tmp}"
 export PIP_CACHE_DIR="${PIP_CACHE_DIR:-$QVDIT_AUTODL_ROOT/cache/pip}"
 export HF_HOME="${HF_HOME:-$QVDIT_AUTODL_ROOT/cache/huggingface}"
