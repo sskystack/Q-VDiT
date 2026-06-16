@@ -13,14 +13,14 @@ model = dict(
 )
 vae = dict(
     type="VideoAutoencoderKL",
-    from_pretrained="/root/data-fs/models/stabilityai/sd-vae-ft-ema",
+    from_pretrained="/root/autodl-tmp/models/stabilityai/sd-vae-ft-ema",
     micro_batch_size=128,
 )
 text_encoder = dict(
     type="t5",
-    from_pretrained="/root/data-fs/models/DeepFloyd",
+    from_pretrained="/root/autodl-tmp/models/DeepFloyd",
     local_cache=True,
-    save_pretrained="/root/data-fs/models/DeepFloyd/t5-v1_1-xxl",
+    save_pretrained="/root/autodl-tmp/models/DeepFloyd/t5-v1_1-xxl",
     model_max_length=120,
 )
 scheduler = dict(

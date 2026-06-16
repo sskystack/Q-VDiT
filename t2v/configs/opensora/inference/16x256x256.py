@@ -13,12 +13,12 @@ model = dict(
 )
 vae = dict(
     type="VideoAutoencoderKL",
-    from_pretrained="/share/liuenshu/temp_files/checkpoints/huggingface/sd-vae-ft-ema",
+    from_pretrained="/root/autodl-tmp/models/stabilityai/sd-vae-ft-ema",
 )
 text_encoder = dict(
     type="t5",
     from_pretrained="./pretrained_models/t5_ckpts",
-    save_pretrained="/share/liuenshu/temp_files/checkpoints/text_encoder/pretrained_t5",
+    save_pretrained="/root/autodl-tmp/models/DeepFloyd/t5-v1_1-xxl",
     model_max_length=120,
 )
 scheduler = dict(

@@ -5,7 +5,7 @@ model:
 conditional: True
 cfg_split: True
 calib_data:
-    path: "/mnt/public/liuenshu/temp_files/video_quant/calib_data.pt"
+    path: "/root/autodl-tmp/Q-VDiT/logs_100steps/calib_data.pt"
     n_steps: 10    # calib_data_sample_steps = total setps // n_steps
     batch_size: 4  # used for quant param initialization
     n_samples: 10
