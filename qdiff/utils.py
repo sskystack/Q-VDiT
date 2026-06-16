@@ -339,6 +339,7 @@ def save_in_out_data(model: QuantModel, layer: Union[QuantLayer, BaseQuantBlock]
     l_in_0, l_in_1, l_in, l_out = 0, 0, 0, 0
     if split_save_attn:
         num //= 2
+    keep_cache_on_cpu = config.calib_data.get("keep_cache_on_cpu", False)
 
     # INFO: iter through all the calib_data, save all input and output
     # defaults
@@ -433,10 +434,12 @@ def save_in_out_data(model: QuantModel, layer: Union[QuantLayer, BaseQuantBlock]
                             tmp_list = None
                         else:
                             for shape, indices in shape_to_indices.items():
-                                tmp_list.append(torch.cat([cached_batches[indice][0][i] for indice in indices]).to(device))
+                                tmp = torch.cat([cached_batches[indice][0][i] for indice in indices])
+                                tmp_list.append(tmp if keep_cache_on_cpu else tmp.to(device))
                     cached_inps.append(tmp_list)
                 for shape, indices in shape_to_indices.items():
-                    cached_outs.append(torch.cat([cached_batches[indice][1] for indice in indices]).to(device))
+                    tmp = torch.cat([cached_batches[indice][1] for indice in indices])
+                    cached_outs.append(tmp if keep_cache_on_cpu else tmp.to(device))
                 
                 # import ipdb; ipdb.set_trace()
                 
@@ -475,7 +478,6 @@ def save_in_out_data(model: QuantModel, layer: Union[QuantLayer, BaseQuantBlock]
         logger.info(f"out shape: {cached_outs.shape}")
     torch.cuda.empty_cache()
 
-    keep_cache_on_cpu = config.calib_data.get("keep_cache_on_cpu", False)
     if keep_cache_on_cpu:
         logger.info("Keeping reconstruction cache on CPU")
     else:

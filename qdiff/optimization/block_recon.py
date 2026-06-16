@@ -36,6 +36,16 @@ def index_to_device(x, idx, device):
     return x[idx].to(device)
 
 
+def move_to_device(x, device):
+    if torch.is_tensor(x):
+        return x.to(device)
+    if isinstance(x, list):
+        return [move_to_device(v, device) for v in x]
+    if isinstance(x, tuple):
+        return tuple(move_to_device(v, device) for v in x)
+    return x
+
+
 def block_reconstruction(model: QuantModel, block: BaseQuantBlock, calib_data: torch.Tensor, config, param_types, opt_target):
                          # batch_size: int = 32, iters: int = 20000, weight: float = 0.01, opt_mode: str = 'mse',
                          # asym: bool = False, include_act_func: bool = True, b_range: tuple = (20, 2),
@@ -281,17 +291,17 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock, calib_data: t
                 # idx = torch.randperm(cached_inps[0].size(0))[:batch_size]
                 for j in range(len(cached_inps)):
                     if j in [1]:
-                        cur_inp.append(cached_inps[j][pmp_id][idx].requires_grad_())
+                        cur_inp.append(move_to_device(cached_inps[j][pmp_id][idx], device).requires_grad_())
                     elif j in [4]:
                         # 4 prob is None
                         if cached_inps[4] is None:
                             cur_inp.append(None)
                         else:
-                            cur_inp.append(cached_inps[j][pmp_id][idx])
+                            cur_inp.append(move_to_device(cached_inps[j][pmp_id][idx], device))
                     elif j in [3]:
-                        cur_inp.append(cached_inps[j][pmp_id][idx])
+                        cur_inp.append(move_to_device(cached_inps[j][pmp_id][idx], device))
                     else:
-                        cur_inp.append(torch.cat([cached_inps[j][pmp_id][index] for index in [idx*4, idx*4+1, idx*4+2, idx*4+3]]).requires_grad_())
+                        cur_inp.append(torch.cat([move_to_device(cached_inps[j][pmp_id][index], device) for index in [idx*4, idx*4+1, idx*4+2, idx*4+3]]).requires_grad_())
                     '''if cached_inps[j] == None:
                         cur_inp.append(None)
                     else:
@@ -303,7 +313,7 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock, calib_data: t
             cur_inp = index_to_device(cached_inps, idx, device)
         if isinstance(cached_outs, list):
             # cur_out = cached_outs[pmp_id][idx]
-            cur_out = torch.cat([cached_outs[pmp_id][index] for index in [idx*4, idx*4+1, idx*4+2, idx*4+3]])
+            cur_out = torch.cat([move_to_device(cached_outs[pmp_id][index], device) for index in [idx*4, idx*4+1, idx*4+2, idx*4+3]])
         else:
             cur_out = index_to_device(cached_outs, idx, device)
         cur_grad = cached_grads[idx] if use_grad else None

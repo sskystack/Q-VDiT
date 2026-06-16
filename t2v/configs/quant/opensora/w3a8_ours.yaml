@@ -6,9 +6,10 @@ conditional: True
 cfg_split: True
 calib_data:
     path: "your path of calib data"
-    n_steps: 100    # calib_data_sample_steps = total setps // n_steps
-    batch_size: 4  # used for quant param initialization
+    n_steps: 50    # calib_data_sample_steps = total setps // n_steps
+    batch_size: 2  # used for quant param initialization
     n_samples: 10
+    keep_cache_on_cpu: True
 quant:
     weight:
         optimization:
