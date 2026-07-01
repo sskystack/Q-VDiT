@@ -115,6 +115,9 @@ def main():
     calib_data = {}
     input_data_list = []
     output_data_list = []
+    init_noise_all = None
+    if cfg.get("init_noise_path", None) is not None:
+        init_noise_all = move_tensors_to_device(torch.load(cfg.init_noise_path, map_location="cpu"), device, dtype)
     if PRECOMPUTE_TEXT_EMBEDS is not None:
         model_args['precompute_text_embeds'] = move_tensors_to_device(
             torch.load(cfg.precompute_text_embeds, map_location="cpu"),
@@ -124,6 +127,9 @@ def main():
 
     for i in range(0, len(prompts), cfg.batch_size):
         batch_prompts = prompts[i : i + cfg.batch_size]
+        init_noise = None
+        if init_noise_all is not None:
+            init_noise = init_noise_all[i : i + len(batch_prompts)]
         if PRECOMPUTE_TEXT_EMBEDS is not None:  # also feed in the idxs for saved text_embeds
             model_args['batch_ids'] = torch.arange(i,i+cfg.batch_size)
         samples, cur_calib_data, out_data = scheduler.sample(
@@ -135,6 +141,7 @@ def main():
             device=device,
             return_trajectory=True,
             additional_args=model_args,
+            init_noise=init_noise,
         )
 
         for key in cur_calib_data:

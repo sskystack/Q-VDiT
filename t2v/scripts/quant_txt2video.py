@@ -271,6 +271,10 @@ def main():
     sample_idx = global_start_idx
     save_dir = opt.save_dir
     os.makedirs(save_dir, exist_ok=True)
+    output_data_list = []
+    init_noise_all = None
+    if cfg.get("init_noise_path", None) is not None:
+        init_noise_all = move_tensors_to_device(torch.load(cfg.init_noise_path, map_location="cpu"), device, dtype)
     if PRECOMPUTE_TEXT_EMBEDS is not None:
         model_args['precompute_text_embeds'] = move_tensors_to_device(
             torch.load(cfg.precompute_text_embeds, map_location="cpu"),
@@ -280,17 +284,36 @@ def main():
     print(cfg.batch_size)
     for i in range(0, len(prompts), cfg.batch_size):
         batch_prompts = prompts[i : i + cfg.batch_size]
+        init_noise = None
+        if init_noise_all is not None:
+            init_noise = init_noise_all[global_start_idx + i : global_start_idx + i + len(batch_prompts)]
         if PRECOMPUTE_TEXT_EMBEDS is not None:  # also feed in the idxs for saved text_embeds
             model_args['batch_ids'] = torch.arange(global_start_idx + i, global_start_idx + i + len(batch_prompts))
-        samples = scheduler.sample(
-            qnn,
-            text_encoder,
-            sampler_type=cfg.sampler,
-            z_size=(vae.out_channels, *latent_size),
-            prompts=batch_prompts,
-            device=device,
-            additional_args=model_args,
-        )
+        if cfg.get("save_inp_oup", False):
+            samples, cur_calib_data, out_data = scheduler.sample(
+                qnn,
+                text_encoder,
+                sampler_type=cfg.sampler,
+                z_size=(vae.out_channels, *latent_size),
+                prompts=batch_prompts,
+                device=device,
+                return_trajectory=True,
+                additional_args=model_args,
+                init_noise=init_noise,
+            )
+            output_data_list.append(out_data)
+            torch.save(output_data_list, os.path.join(save_dir, "output_list.pt"))
+        else:
+            samples = scheduler.sample(
+                qnn,
+                text_encoder,
+                sampler_type=cfg.sampler,
+                z_size=(vae.out_channels, *latent_size),
+                prompts=batch_prompts,
+                device=device,
+                additional_args=model_args,
+                init_noise=init_noise,
+            )
         samples = vae.decode(samples.to(dtype))
 
         for idx, sample in enumerate(samples):

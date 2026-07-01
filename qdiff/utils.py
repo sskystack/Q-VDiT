@@ -139,6 +139,7 @@ class LossFunction:
                  module_type='layer',
                  use_reconstruction_loss=False,
                  use_round_loss=False,
+                 cfg_loss_weight: float = 0.,
                  ):
 
         self.module = module
@@ -152,10 +153,23 @@ class LossFunction:
         self.p = p
         self.use_reconstruction_loss = use_reconstruction_loss
         self.use_round_loss = use_round_loss
+        self.cfg_loss_weight = cfg_loss_weight
 
         self.temp_decay = LinearTempDecay(iters, rel_start_decay=warmup + (1 - warmup) * decay_start,
                                           start_b=b_range[0], end_b=b_range[1])
         self.count = 0
+
+    def _cfg_residual_loss(self, pred, tgt):
+        if self.cfg_loss_weight <= 0:
+            return pred.new_tensor(0.)
+        if pred.shape[0] < 2 or pred.shape[0] % 2 != 0:
+            return pred.new_tensor(0.)
+
+        pred_cond, pred_uncond = pred.chunk(2, dim=0)
+        tgt_cond, tgt_uncond = tgt.chunk(2, dim=0)
+        pred_residual = pred_cond - pred_uncond
+        tgt_residual = tgt_cond - tgt_uncond
+        return lp_loss(pred_residual, tgt_residual, p=int(self.p), reduction='all')
 
     def __call__(self, pred, tgt, grad=None):
         """
@@ -193,6 +207,8 @@ class LossFunction:
         else:
             reconstruction_loss = 0.
 
+        cfg_loss = self._cfg_residual_loss(pred, tgt)
+
         b = self.temp_decay(self.count)
         if self.use_round_loss:
             if self.count < self.loss_start or self.round_loss_type == 'none':
@@ -215,12 +231,13 @@ class LossFunction:
             round_loss = 0.
 
         total_loss += reconstruction_loss
+        total_loss += self.cfg_loss_weight * cfg_loss
         total_loss += round_loss
         if self.count % 100 == 0:
             reconstruction_loss = -1 if not self.use_reconstruction_loss else reconstruction_loss
             round_loss = -1 if not self.use_round_loss else round_loss
-            logger.info('Total loss:\t{:.6f} (rec:{:.6f}, round:{:.6})\tb={:.2f}\tcount={}'.format(
-                  float(total_loss), float(reconstruction_loss), float(round_loss), b, self.count))
+            logger.info('Total loss:\t{:.6f} (rec:{:.6f}, cfg:{:.6f}, round:{:.6})\tb={:.2f}\tcount={}'.format(
+                  float(total_loss), float(reconstruction_loss), float(cfg_loss), float(round_loss), b, self.count))
         return total_loss
 
 

@@ -1,3 +1,4 @@
+import os
 import torch
 # import linklink as link
 import logging
@@ -44,6 +45,60 @@ def move_to_device(x, device):
     if isinstance(x, tuple):
         return tuple(move_to_device(v, device) for v in x)
     return x
+
+
+def sample_cfg_pair_indices(total_size, n_samples, iters, pair_batch_size, device):
+    group_size = n_samples * 2
+    if group_size <= 0:
+        raise ValueError("n_samples must be positive when using CFG residual loss")
+    all_indices = torch.arange(total_size, device=device)
+    cond_indices = all_indices[(all_indices % group_size) < n_samples]
+    if cond_indices.numel() == 0:
+        raise ValueError("No conditional samples found for CFG residual loss")
+
+    rand_ids = torch.randint(
+        low=0,
+        high=cond_indices.numel(),
+        size=(iters, pair_batch_size),
+        device=device,
+    )
+    cond = cond_indices[rand_ids]
+    uncond = cond + n_samples
+    return torch.cat([cond, uncond], dim=1)
+
+
+def clone_index_state(obj):
+    if torch.is_tensor(obj):
+        return obj.detach().cpu()
+    if isinstance(obj, list):
+        return [clone_index_state(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(clone_index_state(v) for v in obj)
+    return obj
+
+
+def move_index_state(obj, device):
+    if torch.is_tensor(obj):
+        return obj.to(device)
+    if isinstance(obj, list):
+        return [move_index_state(v, device) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(move_index_state(v, device) for v in obj)
+    return obj
+
+
+def restore_quant_params(model, quant_params_dict):
+    current = model.get_quant_params_dict()
+    for name, value in quant_params_dict.items():
+        if isinstance(value, list):
+            for saved_dict, current_dict in zip(value, current[name]):
+                for key, tensor in saved_dict.items():
+                    if tensor is not None:
+                        current_dict[key].data.copy_(tensor.to(current_dict[key].device, dtype=current_dict[key].dtype))
+                    else:
+                        current_dict[key] = None
+        else:
+            current[name].data.copy_(value.to(current[name].device, dtype=current[name].dtype))
 
 
 def block_reconstruction(model: QuantModel, block: BaseQuantBlock, calib_data: torch.Tensor, config, param_types, opt_target):
@@ -230,6 +285,15 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock, calib_data: t
     config_loss['use_reconstruction_loss'] = ('delta' in param_types or 'delta_out' in param_types)
     config_loss['use_round_loss'] = 'alpha' in param_types
     loss_func = LossFunction(block, **config_loss)
+    cfg_loss_weight = float(config_loss.get('cfg_loss_weight', 0.))
+    save_interval = int(getattr(config.quant.weight.optimization, 'save_interval', 0))
+    save_dir = getattr(config.quant.weight.optimization, 'save_dir', None)
+    resume_ckpt = getattr(config.quant.weight.optimization, 'resume_ckpt', None)
+    if save_interval > 0:
+        if save_dir is None:
+            logger.warning("save_interval is set but save_dir is missing; intermediate checkpoints will be skipped")
+        else:
+            os.makedirs(save_dir, exist_ok=True)
 
     # move to gpu device
     # sample_idxs = torch.randint(low=0,high=cached_inps.shape[0],size=(iters,batch_size))
@@ -240,14 +304,61 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock, calib_data: t
                 idxs_list.append(torch.randint(low=0,high=cached_inps[1][i].shape[0],size=(iters,1), device=cached_inps[1][i].device))
             pmp_idxs = torch.randint(low=0,high=len(cached_outs),size=(iters, 1), device=cached_inps[0][0].device)
         else:
-            sample_idxs = torch.randint(low=0,high=cached_inps[0].shape[0],size=(iters,batch_size), device=cached_inps[0].device)
+            if cfg_loss_weight > 0:
+                pair_batch_size = max(1, batch_size // 2)
+                sample_idxs = sample_cfg_pair_indices(
+                    cached_inps[0].shape[0],
+                    config.calib_data.n_samples,
+                    iters,
+                    pair_batch_size,
+                    cached_inps[0].device,
+                )
+            else:
+                sample_idxs = torch.randint(low=0,high=cached_inps[0].shape[0],size=(iters,batch_size), device=cached_inps[0].device)
     else:
-        sample_idxs = torch.randint(low=0,high=cached_inps.shape[0],size=(iters,batch_size), device=cached_inps.device)
+        if cfg_loss_weight > 0:
+            pair_batch_size = max(1, batch_size // 2)
+            sample_idxs = sample_cfg_pair_indices(
+                cached_inps.shape[0],
+                config.calib_data.n_samples,
+                iters,
+                pair_batch_size,
+                cached_inps.device,
+            )
+        else:
+            sample_idxs = torch.randint(low=0,high=cached_inps.shape[0],size=(iters,batch_size), device=cached_inps.device)
     torch.set_grad_enabled(True)
     # import ipdb; ipdb.set_trace()
     # iters = 16 # debug
     if enable_fp32:
         scaler = GradScaler()
+    start_iter = 0
+    resume_state = None
+    if resume_ckpt is not None:
+        resume_state = torch.load(resume_ckpt, map_location="cpu")
+        if resume_state.get("opt_target") != opt_target:
+            raise ValueError(f"resume opt_target mismatch: {resume_state.get('opt_target')} vs {opt_target}")
+        if int(resume_state.get("iters", iters)) != iters:
+            raise ValueError(f"resume iters mismatch: {resume_state.get('iters')} vs {iters}")
+        restore_quant_params(model, resume_state["quant_params"])
+        optimizer.load_state_dict(resume_state["optimizer"])
+        scheduler.load_state_dict(resume_state["scheduler"])
+        if enable_fp32 and "scaler" in resume_state and resume_state["scaler"] is not None:
+            scaler.load_state_dict(resume_state["scaler"])
+        loss_func.count = int(resume_state.get("loss_count", 0))
+        start_iter = int(resume_state["iter"])
+        if resume_state.get("sample_idxs") is not None:
+            sample_idxs = move_index_state(resume_state["sample_idxs"], sample_idxs.device)
+        if resume_state.get("idxs_list") is not None:
+            idxs_list = move_index_state(resume_state["idxs_list"], idxs_list[0].device)
+        if resume_state.get("pmp_idxs") is not None:
+            pmp_idxs = move_index_state(resume_state["pmp_idxs"], pmp_idxs.device)
+        if "torch_rng_state" in resume_state:
+            torch.set_rng_state(resume_state["torch_rng_state"])
+        if torch.cuda.is_available() and "cuda_rng_state" in resume_state and resume_state["cuda_rng_state"] is not None:
+            torch.cuda.set_rng_state(resume_state["cuda_rng_state"], device=device)
+        logger.info(f"Resuming reconstruction from {resume_ckpt} at iter {start_iter}/{iters}")
+
     for name, param in block.named_parameters():
         if ('lora' in name and 'minus' not in name) or 'delta' in name or 'mask' in name:
         # if 'lora' in name or 'zero_point' in name or 'delta' in name or 'zp_list' in name:
@@ -261,7 +372,7 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock, calib_data: t
     for i in range(1, 27):
         set_grad_checkpoint(block.blocks[i])
 
-    for i in range(iters):
+    for i in range(start_iter, iters):
         # print(i)
         # import time
         # t0 = time.time()
@@ -369,6 +480,27 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock, calib_data: t
             optimizer.step()
         if scheduler:
             scheduler.step()
+        if save_interval > 0 and save_dir is not None and (i + 1) % save_interval == 0:
+            ckpt_path = os.path.join(save_dir, f"ckpt_iter{i + 1}.pth")
+            torch.save(model.get_quant_params_dict(), ckpt_path)
+            resume_path = os.path.join(save_dir, f"resume_iter{i + 1}.pth")
+            torch.save({
+                "iter": i + 1,
+                "iters": iters,
+                "opt_target": opt_target,
+                "quant_params": model.get_quant_params_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "scaler": scaler.state_dict() if enable_fp32 else None,
+                "loss_count": loss_func.count,
+                "sample_idxs": clone_index_state(sample_idxs) if 'sample_idxs' in locals() else None,
+                "idxs_list": clone_index_state(idxs_list) if 'idxs_list' in locals() else None,
+                "pmp_idxs": clone_index_state(pmp_idxs) if 'pmp_idxs' in locals() else None,
+                "torch_rng_state": torch.get_rng_state(),
+                "cuda_rng_state": torch.cuda.get_rng_state(device=device) if torch.cuda.is_available() else None,
+            }, resume_path)
+            logger.info(f"Saved intermediate quant checkpoint to {ckpt_path}")
+            logger.info(f"Saved reconstruction resume checkpoint to {resume_path}")
 
     # import ipdb; ipdb.set_trace()
     torch.cuda.empty_cache()

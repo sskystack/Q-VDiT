@@ -57,6 +57,10 @@ def main():
     )
     logger = logging.getLogger(__name__)
     config = OmegaConf.load(f"{opt.calib_config}")
+    if config.quant.weight.optimization.get("save_interval", 0):
+        config.quant.weight.optimization.save_dir = os.path.join(outpath, "intermediate_ckpts")
+    if cfg.get("resume_recon_ckpt", None) is not None:
+        config.quant.weight.optimization.resume_ckpt = cfg.resume_recon_ckpt
     logger.info("Conducting Command: %s", " ".join(sys.argv))
 
     # ======================================================

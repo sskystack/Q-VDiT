@@ -35,6 +35,7 @@ def parse_args(training=False, mode=None):
         # hyperparameters
         parser.add_argument("--num_sampling_steps", default=None, type=int, help="sampling steps")
         parser.add_argument("--cfg_scale", default=None, type=float, help="balance between cond & uncond")
+        parser.add_argument("--init_noise_path", default=None, type=str, help="path to fixed latent noise for sampling")
         # sampler
         parser.add_argument("--sampler", default="ddim", type=str, help="sampler type")
     else:
@@ -48,8 +49,10 @@ def parse_args(training=False, mode=None):
         parser.add_argument("--save_inp_oup", action="store_true")
     elif mode == 'ptq':
         parser.add_argument("--calib_data", default=None, type=str, help="path to quantization calib data")
+        parser.add_argument("--resume_recon_ckpt", default=None, type=str, help="path to reconstruction resume checkpoint")
     elif mode == "quant_inference":
         parser.add_argument("--dataset_type", default="opensora", type=str)
+        parser.add_argument("--save_inp_oup", action="store_true", help="save trajectory model outputs for debugging")
         parser.add_argument(
             "--quant_ckpt",
             type=str,
