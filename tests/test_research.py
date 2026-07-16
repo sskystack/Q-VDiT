@@ -80,6 +80,33 @@ def test_single_group_tarq_reduces_to_one_low_rank_residual():
     assert module.last_budget_loss.item() == 0.0
 
 
+def test_taq_rank_budget_changes_the_number_of_active_groups():
+    module = TrackAwareResidual(3, 2, config(diffusion="TAQ", groups=4))
+    gates = torch.tensor([[[[0.4, 0.3, 0.2, 0.1]]]])
+    with torch.no_grad():
+        module.taq_rank_logit.fill_(-8.0)
+        _, low_budget = module._temperature_and_budget()
+        _, low_mask = module._allocate_rank_groups(gates, low_budget)
+        module.taq_rank_logit.fill_(8.0)
+        _, high_budget = module._temperature_and_budget()
+        _, high_mask = module._allocate_rank_groups(gates, high_budget)
+    assert low_budget.item() < 1.01
+    assert high_budget.item() > 3.99
+    assert low_mask.sum().item() < high_mask.sum().item()
+
+
+def test_taq_rank_budget_receives_reconstruction_gradients():
+    module = TrackAwareResidual(3, 2, config(diffusion="TAQ", groups=4))
+    with torch.no_grad():
+        module.up.fill_(0.1)
+        module.gate.weight.normal_(0.0, 0.1)
+    module.set_trajectory_position(25, 50)
+    output = module(torch.randn(2, 4, 3), batch=1, frames=2, spatial_tokens=4, layout="spatial")
+    (output.square().mean() + module.budget_regularization()).backward()
+    assert module.taq_rank_logit.grad is not None
+    assert module.taq_rank_logit.grad.abs().sum().item() > 0.0
+
+
 def test_mtd_is_zero_for_identical_features_and_positive_for_motion_error():
     target = torch.randn(2, 4, 3, 8, 8)
     identical = motion_transport_distillation(target, target, config(frame="MTD"))

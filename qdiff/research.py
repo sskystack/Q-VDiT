@@ -141,7 +141,9 @@ class TrackAwareResidual(nn.Module):
         nn.init.zeros_(self.gate.bias)
         if self.taq_enabled:
             self.taq_log_temperature = nn.Parameter(torch.zeros(self.num_bins))
-            self.taq_rank_logit = nn.Parameter(torch.zeros(self.num_bins))
+            # Start from one active rank/group per timestep bin. Reconstruction
+            # gradients can spend more rank in difficult denoising regions.
+            self.taq_rank_logit = nn.Parameter(torch.full((self.num_bins,), -6.0))
         else:
             self.register_parameter("taq_log_temperature", None)
             self.register_parameter("taq_rank_logit", None)
@@ -153,13 +155,34 @@ class TrackAwareResidual(nn.Module):
         self.trajectory_step_index = int(step_index)
         self.trajectory_num_steps = int(num_steps)
 
-    def _temperature_and_scale(self):
+    def _temperature_and_budget(self):
         if not self.taq_enabled:
-            return self.base_temperature, 1.0
+            return self.base_temperature, self.rank_budget
         bin_id = trajectory_bin(self.trajectory_step_index, self.trajectory_num_steps, self.num_bins)
         temperature = self.base_temperature * self.taq_log_temperature[bin_id].exp().clamp(0.5, 2.0)
-        rank_scale = 0.5 + torch.sigmoid(self.taq_rank_logit[bin_id])
-        return temperature, rank_scale
+        rank_budget = 1.0 + (self.num_groups - 1.0) * torch.sigmoid(self.taq_rank_logit[bin_id])
+        return temperature, rank_budget
+
+    def _allocate_rank_groups(self, soft_gates, rank_budget):
+        if self.num_groups == 1:
+            return soft_gates, torch.ones_like(soft_gates)
+        # Rank positions are non-differentiable, while the soft active mask is
+        # differentiable with respect to both gate scores and the TAQ budget.
+        order = soft_gates.argsort(dim=-1, descending=True)
+        positions = torch.empty_like(soft_gates)
+        rank_ids = torch.arange(1, self.num_groups + 1, device=soft_gates.device, dtype=soft_gates.dtype)
+        rank_ids = rank_ids.view(*([1] * (soft_gates.ndim - 1)), self.num_groups).expand_as(soft_gates)
+        positions.scatter_(-1, order, rank_ids)
+        active_mask = torch.sigmoid((rank_budget + 0.5 - positions) / 0.25)
+        allocated = soft_gates * active_mask
+        allocated = allocated / allocated.sum(dim=-1, keepdim=True).clamp_min(1.0e-8)
+        return allocated, active_mask
+
+    def budget_regularization(self):
+        if not self.taq_enabled:
+            return self.down.new_tensor(0.0)
+        all_bin_budgets = 1.0 + (self.num_groups - 1.0) * torch.sigmoid(self.taq_rank_logit)
+        return (all_bin_budgets.mean() - self.rank_budget).square()
 
     def forward(self, inputs, batch, frames, spatial_tokens, layout):
         side = int(math.sqrt(spatial_tokens))
@@ -172,7 +195,7 @@ class TrackAwareResidual(nn.Module):
         else:
             raise ValueError(f"Unknown TARQ layout: {layout}")
         video_grid = video.reshape(batch, frames, side, side, inputs.shape[-1])
-        temperature, rank_scale = self._temperature_and_scale()
+        temperature, rank_budget = self._temperature_and_budget()
         transport_temperature = float(temperature.detach()) if torch.is_tensor(temperature) else float(temperature)
         motion = _compact_transport_features(
             video_grid, self.transport_size, self.descriptor_dim, transport_temperature
@@ -181,24 +204,25 @@ class TrackAwareResidual(nn.Module):
         motion = F.interpolate(motion, size=(side, side), mode="bilinear", align_corners=False)
         motion = motion.reshape(batch, frames, 3, spatial_tokens).permute(0, 1, 3, 2)
         gate_logits = self.gate(motion) / temperature
-        gates = F.softmax(gate_logits, dim=-1)
-        effective_groups = torch.exp(-(gates.clamp_min(1.0e-8) * gates.clamp_min(1.0e-8).log()).sum(-1))
-        self.last_budget_loss = (effective_groups.mean() - self.rank_budget).square()
+        soft_gates = F.softmax(gate_logits, dim=-1)
+        gates, active_mask = self._allocate_rank_groups(soft_gates, rank_budget)
+        if self.taq_enabled:
+            self.last_budget_loss = self.budget_regularization()
+        else:
+            self.last_budget_loss = (active_mask.sum(dim=-1).mean() - self.rank_budget).square()
 
         correction = torch.zeros(*video.shape[:-1], self.up.shape[1], device=inputs.device, dtype=inputs.dtype)
         for group in range(self.num_groups):
             low_rank = F.linear(video, self.down[group].to(inputs.dtype))
             low_rank = F.linear(low_rank, self.up[group].to(inputs.dtype))
             correction = correction + gates[..., group : group + 1].to(inputs.dtype) * low_rank
-        correction = correction * rank_scale
         if layout == "spatial":
             return correction.reshape(batch * frames, spatial_tokens, -1)
         return correction.permute(0, 2, 1, 3).reshape(batch * spatial_tokens, frames, -1)
 
 
 def collect_rank_budget_loss(module):
-    losses = [child.last_budget_loss for child in module.modules() if isinstance(child, TrackAwareResidual)]
-    losses = [loss for loss in losses if loss is not None]
+    losses = [child.budget_regularization() for child in module.modules() if isinstance(child, TrackAwareResidual)]
     if not losses:
         parameter = next(module.parameters(), None)
         return torch.tensor(0.0, device=parameter.device if parameter is not None else "cpu")
