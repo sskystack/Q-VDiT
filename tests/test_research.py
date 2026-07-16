@@ -42,6 +42,9 @@ def test_four_configs_have_the_expected_single_variable_progression():
         data = yaml.safe_load((root / filename).read_text())
         assert data["calib_data"]["n_steps"] == 50
         assert data["calib_data"]["batch_size"] == 4
+        assert data["calib_data"]["keep_cache_on_cpu"] is True
+        assert data["calib_data"]["pin_memory"] is True
+        assert data["calib_data"]["async_prefetch"] is True
         assert tuple(data["method"].values()) == methods
 
 

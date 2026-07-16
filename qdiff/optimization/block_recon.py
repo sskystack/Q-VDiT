@@ -1,4 +1,5 @@
 import torch
+from concurrent.futures import ThreadPoolExecutor
 # import linklink as link
 import logging
 from qdiff.quantizer.base_quantizer import lp_loss
@@ -15,6 +16,116 @@ from opensora.acceleration.checkpoint import set_grad_checkpoint
 
 logger = logging.getLogger(__name__)
 enable_fp32 = False
+
+
+def _pin_cpu_tensors(obj):
+    """Copy a nested CPU batch into page-locked staging memory."""
+    if torch.is_tensor(obj):
+        if obj.device.type == 'cpu' and not obj.is_pinned():
+            return obj.pin_memory()
+        return obj
+    if isinstance(obj, tuple):
+        return tuple(_pin_cpu_tensors(item) for item in obj)
+    if isinstance(obj, list):
+        return [_pin_cpu_tensors(item) for item in obj]
+    if isinstance(obj, dict):
+        return {key: _pin_cpu_tensors(value) for key, value in obj.items()}
+    return obj
+
+
+def _move_to_device(obj, device, non_blocking=False):
+    """Move tensors in an arbitrarily nested reconstruction batch."""
+    if torch.is_tensor(obj):
+        return obj.to(device, non_blocking=non_blocking)
+    if isinstance(obj, tuple):
+        return tuple(_move_to_device(item, device, non_blocking) for item in obj)
+    if isinstance(obj, list):
+        return [_move_to_device(item, device, non_blocking) for item in obj]
+    if isinstance(obj, dict):
+        return {key: _move_to_device(value, device, non_blocking) for key, value in obj.items()}
+    return obj
+
+
+class _AsyncCudaBatchPrefetcher:
+    """One-batch-ahead CPU staging and CUDA-stream prefetch.
+
+    CPU indexing and pinning run in a worker thread while the default stream
+    reconstructs the current batch.  The returned host references are kept
+    alive until the consumer has completed the corresponding iteration.
+    """
+
+    def __init__(self, load_batch, device, pin_memory=True):
+        self.load_batch = load_batch
+        self.device = torch.device(device)
+        self.pin_memory = pin_memory
+        self.stream = torch.cuda.Stream(device=self.device)
+        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='qvdit-prefetch')
+        self.future = None
+
+    def _prepare(self, iteration):
+        batch = self.load_batch(iteration)
+        host_batch = _pin_cpu_tensors(batch) if self.pin_memory else batch
+        with torch.cuda.device(self.device), torch.cuda.stream(self.stream):
+            device_batch = _move_to_device(host_batch, self.device, non_blocking=self.pin_memory)
+            ready = torch.cuda.Event()
+            ready.record(self.stream)
+        return device_batch, host_batch, ready
+
+    def start(self, iteration=0):
+        self.future = self.executor.submit(self._prepare, iteration)
+
+    def next(self, next_iteration=None):
+        device_batch, host_batch, ready = self.future.result()
+        torch.cuda.current_stream(self.device).wait_event(ready)
+        if next_iteration is None:
+            self.future = None
+        else:
+            self.future = self.executor.submit(self._prepare, next_iteration)
+        return device_batch, host_batch
+
+    def close(self):
+        if self.future is not None:
+            self.future.result()
+        self.executor.shutdown(wait=True)
+
+
+def _select_reconstruction_batch(cached_inps, cached_outs, cached_grads, use_grad, idx, pmp_id=None):
+    """Select one reconstruction mini-batch without changing cache placement."""
+    if isinstance(cached_outs, list):
+        pmp_id = int(pmp_id.item()) if torch.is_tensor(pmp_id) else int(pmp_id)
+
+    if isinstance(cached_inps, list):
+        if len(cached_inps) == 2:
+            cur_inp = (cached_inps[0][idx], cached_inps[1][idx])
+        elif len(cached_inps) == 3:
+            cur_inp = (cached_inps[0][idx], cached_inps[1][idx], cached_inps[2][idx])
+        else:
+            selected = []
+            scalar_idx = int(idx.item()) if torch.is_tensor(idx) and idx.numel() == 1 else idx
+            for j in range(len(cached_inps)):
+                if j == 4 and cached_inps[j] is None:
+                    selected.append(None)
+                elif j in (1, 3, 4):
+                    selected.append(cached_inps[j][pmp_id][idx])
+                else:
+                    selected.append(torch.cat([
+                        cached_inps[j][pmp_id][scalar_idx * 4 + offset]
+                        for offset in range(4)
+                    ]))
+            cur_inp = tuple(selected)
+    else:
+        cur_inp = cached_inps[idx]
+
+    if isinstance(cached_outs, list):
+        scalar_idx = int(idx.item()) if torch.is_tensor(idx) else int(idx)
+        cur_out = torch.cat([
+            cached_outs[pmp_id][scalar_idx * 4 + offset]
+            for offset in range(4)
+        ])
+    else:
+        cur_out = cached_outs[idx]
+    cur_grad = cached_grads[idx] if use_grad else None
+    return cur_inp, cur_out, cur_grad
 def mv_to_gpu(l_x, device='cuda'):
     if l_x is None:
         pass
@@ -224,6 +335,9 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock, calib_data: t
 
     research_config = normalize_research_config(config)
     taq_enabled = research_config['diffusion_axis'] == 'TAQ'
+    keep_cache_on_cpu = bool(getattr(config.calib_data, 'keep_cache_on_cpu', False))
+    async_prefetch = bool(getattr(config.calib_data, 'async_prefetch', True))
+    pin_memory = bool(getattr(config.calib_data, 'pin_memory', True))
 
     # move to gpu device
     # sample_idxs = torch.randint(low=0,high=cached_inps.shape[0],size=(iters,batch_size))
@@ -267,65 +381,46 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock, calib_data: t
     for i in range(1, 27):
         set_grad_checkpoint(block.blocks[i])
 
+    def load_reconstruction_batch(iteration):
+        if isinstance(cached_outs, list):
+            selected_pmp = pmp_idxs[iteration]
+            selected_pmp_id = int(selected_pmp.item())
+            selected_idx = idxs_list[selected_pmp_id][iteration]
+        else:
+            selected_pmp = None
+            selected_idx = sample_idxs[iteration, :]
+        selected = _select_reconstruction_batch(
+            cached_inps, cached_outs, cached_grads, use_grad,
+            selected_idx, selected_pmp,
+        )
+        trajectory_step = None
+        if taq_enabled and not isinstance(cached_outs, list):
+            trajectory_step = int(selected_idx[0].item()) // (config.calib_data.n_samples * 2)
+        return (*selected, trajectory_step)
+
+    prefetcher = None
+    if keep_cache_on_cpu and async_prefetch and torch.device(device).type == 'cuda':
+        logger.info("Using pinned FP32 CPU cache with one-batch-ahead CUDA prefetch")
+        prefetcher = _AsyncCudaBatchPrefetcher(load_reconstruction_batch, device, pin_memory=pin_memory)
+        prefetcher.start(0)
+
     for i in range(iters):
         # print(i)
         # import time
         # t0 = time.time()
         # idx = torch.randperm(cached_inps.size(0))[:batch_size]
-        if isinstance(cached_outs, list):
-            pmp_id = pmp_idxs[i]
-            idx = idxs_list[pmp_id][i]
+        if prefetcher is not None:
+            prefetched, host_batch = prefetcher.next(i + 1 if i + 1 < iters else None)
+            cur_inp, cur_out, cur_grad, trajectory_step = prefetched
         else:
-            idx = sample_idxs[i,:]
-        if taq_enabled and not isinstance(cached_outs, list):
-            trajectory_step = int(idx[0].item()) // (config.calib_data.n_samples * 2)
+            cur_inp, cur_out, cur_grad, trajectory_step = load_reconstruction_batch(i)
+            if keep_cache_on_cpu:
+                cur_inp = _move_to_device(cur_inp, device)
+                cur_out = _move_to_device(cur_out, device)
+                cur_grad = _move_to_device(cur_grad, device)
+
+        if trajectory_step is not None:
             set_trajectory_position(block, trajectory_step, config.calib_data.n_steps)
-        # import ipdb; ipdb.set_trace()
-        if isinstance(cached_inps, list):
-            # 这个对应多输入
-            if len(cached_inps)==2:
-                # idx = torch.randperm(cached_inps[0].size(0))[:batch_size]
-                cur_x = cached_inps[0][idx]
-                cur_t = cached_inps[1][idx]
-                cur_inp = (cur_x, cur_t)
-            elif len(cached_inps)==3:
-                # idx = torch.randperm(cached_inps[0].size(0))[:batch_size]
-                cur_x = cached_inps[0][idx]
-                cur_t = cached_inps[1][idx]
-                cur_y = cached_inps[2][idx]
-                cur_inp = (cur_x, cur_t, cur_y)
-            else:
-                # 针对 QuantTransformerBlock
-                cur_inp = []
-                # idx = torch.randperm(cached_inps[0].size(0))[:batch_size]
-                for j in range(len(cached_inps)):
-                    if j in [1]:
-                        cur_inp.append(cached_inps[j][pmp_id][idx].requires_grad_())
-                    elif j in [4]:
-                        # 4 prob is None
-                        if cached_inps[4] is None:
-                            cur_inp.append(None)
-                        else:
-                            cur_inp.append(cached_inps[j][pmp_id][idx])
-                    elif j in [3]:
-                        cur_inp.append(cached_inps[j][pmp_id][idx])
-                    else:
-                        cur_inp.append(torch.cat([cached_inps[j][pmp_id][index] for index in [idx*4, idx*4+1, idx*4+2, idx*4+3]]).requires_grad_())
-                    '''if cached_inps[j] == None:
-                        cur_inp.append(None)
-                    else:
-                        cur_inp.append(cached_inps[j][idx])'''
-                
-                cur_inp = tuple(cur_inp)
-        else:
-            # idx = torch.randperm(cached_inps.size(0))[:batch_size]  # 随机取样
-            cur_inp = cached_inps[idx]
-        if isinstance(cached_outs, list):
-            # cur_out = cached_outs[pmp_id][idx]
-            cur_out = torch.cat([cached_outs[pmp_id][index] for index in [idx*4, idx*4+1, idx*4+2, idx*4+3]])
-        else:
-            cur_out = cached_outs[idx]
-        cur_grad = cached_grads[idx] if use_grad else None
 
         # import ipdb; ipdb.set_trace()
         optimizer.zero_grad()
@@ -378,6 +473,9 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock, calib_data: t
             optimizer.step()
         if scheduler:
             scheduler.step()
+
+    if prefetcher is not None:
+        prefetcher.close()
 
     # import ipdb; ipdb.set_trace()
     torch.cuda.empty_cache()

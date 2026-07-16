@@ -303,6 +303,7 @@ def save_in_out_data(model: QuantModel, layer: Union[QuantLayer, BaseQuantBlock]
     :return: input and output data
     """
     device = next(model.parameters()).device
+    keep_cache_on_cpu = bool(getattr(config.calib_data, "keep_cache_on_cpu", False))
     get_in_out = GetLayerInOut(model, layer, model_type=model_type, previous_layer_quantized=True)
     cached_batches = []
     cached_inps, cached_outs = None, None
@@ -453,10 +454,12 @@ def save_in_out_data(model: QuantModel, layer: Union[QuantLayer, BaseQuantBlock]
                             tmp_list = None
                         else:
                             for shape, indices in shape_to_indices.items():
-                                tmp_list.append(torch.cat([cached_batches[indice][0][i] for indice in indices]).to(device))
+                                merged = torch.cat([cached_batches[indice][0][i] for indice in indices])
+                                tmp_list.append(merged if keep_cache_on_cpu else merged.to(device))
                     cached_inps.append(tmp_list)
                 for shape, indices in shape_to_indices.items():
-                    cached_outs.append(torch.cat([cached_batches[indice][1] for indice in indices]).to(device))
+                    merged = torch.cat([cached_batches[indice][1] for indice in indices])
+                    cached_outs.append(merged if keep_cache_on_cpu else merged.to(device))
                 
                 # import ipdb; ipdb.set_trace()
                 
@@ -495,27 +498,33 @@ def save_in_out_data(model: QuantModel, layer: Union[QuantLayer, BaseQuantBlock]
         logger.info(f"out shape: {cached_outs.shape}")
     torch.cuda.empty_cache()
 
-    # INFO: move data to gpu, why does it need to move to cpu at first?
-    if isinstance(cached_inps, list):
-        if isinstance(cached_inps[0], list):
-            pass
-        else:
-            if len(cached_inps)==7:
-                cached_inps[0] = cached_inps[0].to(device)
-                cached_inps[2] = cached_inps[2].to(device)
-            elif len(cached_inps)==3:
-                cached_inps[0] = cached_inps[0].to(device)
-                cached_inps[1] = cached_inps[1].to(device)
-                cached_inps[2] = cached_inps[2].to(device)
+    # Keeping the complete FP32 reconstruction cache on GPU can consume almost
+    # the whole device before the first backward pass.  In CPU-cache mode the
+    # reconstruction loop selects only one mini-batch at a time and transfers
+    # it with pinned-memory asynchronous prefetching.
+    if keep_cache_on_cpu:
+        logger.info("Keeping the FP32 reconstruction cache on CPU for asynchronous batch prefetch")
+    else:
+        if isinstance(cached_inps, list):
+            if isinstance(cached_inps[0], list):
+                pass
             else:
-                cached_inps[0] = cached_inps[0].to(device)
-                cached_inps[1] = cached_inps[1].to(device)
-    else:
-        cached_inps = cached_inps.to(device)
-    if isinstance(cached_outs, list):
-        pass
-    else:
-        cached_outs = cached_outs.to(device)
+                if len(cached_inps)==7:
+                    cached_inps[0] = cached_inps[0].to(device)
+                    cached_inps[2] = cached_inps[2].to(device)
+                elif len(cached_inps)==3:
+                    cached_inps[0] = cached_inps[0].to(device)
+                    cached_inps[1] = cached_inps[1].to(device)
+                    cached_inps[2] = cached_inps[2].to(device)
+                else:
+                    cached_inps[0] = cached_inps[0].to(device)
+                    cached_inps[1] = cached_inps[1].to(device)
+        else:
+            cached_inps = cached_inps.to(device)
+        if not isinstance(cached_outs, list):
+            cached_outs = cached_outs.to(device)
+
+    del cached_batches
 
     return cached_inps, cached_outs
 

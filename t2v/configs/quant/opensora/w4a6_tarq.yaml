@@ -21,6 +21,9 @@ calib_data:
   n_steps: 50
   batch_size: 4
   n_samples: 10
+  keep_cache_on_cpu: true
+  pin_memory: true
+  async_prefetch: true
 quant:
   weight:
     optimization:
@@ -68,4 +71,3 @@ quant:
   grad_checkpoint: false
 resume_with_w_quantized:
   path: null
-

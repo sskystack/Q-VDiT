@@ -33,6 +33,9 @@ calib_data:
   n_steps: 2
   batch_size: 2
   n_samples: 1
+  keep_cache_on_cpu: true
+  pin_memory: true
+  async_prefetch: true
 quant:
   weight:
     optimization:
