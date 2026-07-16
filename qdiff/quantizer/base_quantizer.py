@@ -187,6 +187,7 @@ class BaseQuantizer(nn.Module):
         if isinstance(x, nn.Parameter):  # some input weight is parameter, process the tensor
             x = x.data.clone()
         # the min-max quantization parameter init
+        token_reduction_dims = None
         if per_group: # apply channel-wise scaling
             if per_group == 'channel':
                 if self.channel_dim == 0:
@@ -204,15 +205,24 @@ class BaseQuantizer(nn.Module):
                     import ipdb; ipdb.set_trace()
                 # print(self.module_name, x.shape) # shape: [BS, n_token, C_in]
                 n_token = x.shape[1]
-                x = x.permute([1,0,2]).reshape([n_token,-1])  # [n_token, BS*C_in]
+                # Reducing the original [BS, token, channel] tensor over the
+                # batch and channel dimensions is exactly equivalent to the
+                # old permute+reshape, but avoids a full contiguous copy.  For
+                # 512x512 STDiT MLP activations that copy alone is 1.12 GiB at
+                # reconstruction batch size four.
+                token_reduction_dims = (0, 2)
             else:
                 raise NotImplementedError
         else: # apply tensor-wise scaling, return a singular value
             x = x.reshape(-1)
 
-        x_min = x.min(dim=-1)[0]
+        if token_reduction_dims is None:
+            x_min = x.min(dim=-1)[0]
+            x_max = x.max(dim=-1)[0]
+        else:
+            x_min = torch.amin(x, dim=token_reduction_dims)
+            x_max = torch.amax(x, dim=token_reduction_dims)
         x_min[x_min>0] = 0.
-        x_max = x.max(dim=-1)[0] # INFO: used for some meaningless range
         x_max[x_max<0] = 0.
 
         if self.momentum:
