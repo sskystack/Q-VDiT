@@ -378,8 +378,12 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock, calib_data: t
     # for name, param in block.named_parameters():
         # print(f"Parameter {name} requires_grad: {param.requires_grad}")
 
-    for i in range(1, 27):
-        set_grad_checkpoint(block.blocks[i])
+    # TARQ attaches trainable transport/gating branches to the first and last
+    # transformer blocks as well.  Leaving those two blocks outside gradient
+    # checkpointing retains several GiB of their full FP32 graphs and makes a
+    # true reconstruction batch of four exceed a 48 GiB device.
+    for transformer_block in block.blocks:
+        set_grad_checkpoint(transformer_block)
 
     def load_reconstruction_batch(iteration):
         if isinstance(cached_outs, list):
