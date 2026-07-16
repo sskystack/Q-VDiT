@@ -18,7 +18,10 @@ def set_grad_checkpoint(model, use_fp32_attention=False, gc_step=1):
 def auto_grad_checkpoint(module, *args, **kwargs):
     if getattr(module, "grad_checkpointing", False):
         if not isinstance(module, Iterable):
-            return checkpoint(module, *args, **kwargs)
+            # Non-reentrant checkpointing also computes parameter gradients
+            # when none of the block inputs require gradients (notably the
+            # first STDiT block during PTQ reconstruction).
+            return checkpoint(module, *args, use_reentrant=False, **kwargs)
         gc_step = module[0].grad_checkpointing_step
-        return checkpoint_sequential(module, gc_step, *args, **kwargs)
+        return checkpoint_sequential(module, gc_step, *args, use_reentrant=False, **kwargs)
     return module(*args, **kwargs)

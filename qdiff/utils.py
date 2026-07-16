@@ -231,7 +231,7 @@ class LossFunction:
         total_loss += motion_loss
         total_loss += self.research_config["taq"]["trajectory_weight"] * trajectory_loss
         total_loss += self.research_config["tarq"]["rank_budget_weight"] * rank_budget_loss
-        if self.count % 100 == 0:
+        if self.count == 1 or self.count % 100 == 0:
             reconstruction_loss = -1 if not self.use_reconstruction_loss else reconstruction_loss
             round_loss = -1 if not self.use_round_loss else round_loss
             logger.info(
