@@ -7,6 +7,7 @@ import yaml
 from qdiff.research import (
     TrackAwareResidual,
     motion_transport_distillation,
+    normalize_research_config,
     sample_trajectory_pair_indices,
     trajectory_bin,
     trajectory_consistency_loss,
@@ -42,6 +43,11 @@ def test_four_configs_have_the_expected_single_variable_progression():
         assert data["calib_data"]["n_steps"] == 50
         assert data["calib_data"]["batch_size"] == 4
         assert tuple(data["method"].values()) == methods
+
+
+def test_research_config_normalization_is_idempotent():
+    normalized = normalize_research_config(config(frame="MTD", diffusion="TAQ"))
+    assert normalize_research_config(normalized) == normalized
 
 
 def test_trajectory_bins_match_normalized_50_and_100_step_progress():

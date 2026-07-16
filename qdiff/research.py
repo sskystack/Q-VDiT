@@ -18,7 +18,7 @@ def _plain_dict(value):
 
 def normalize_research_config(config=None):
     config = _plain_dict(config)
-    method = _plain_dict(config.get("method"))
+    method = config if "token_axis" in config else _plain_dict(config.get("method"))
     tarq = _plain_dict(config.get("tarq"))
     mtd = _plain_dict(config.get("mtd"))
     taq = _plain_dict(config.get("taq"))
