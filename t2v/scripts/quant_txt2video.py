@@ -145,6 +145,8 @@ def main():
         model=model, \
         weight_quant_params=wq_params,\
         act_quant_params=aq_params,\
+        model_type=config.model.model_type,\
+        research_config=config,\
         # act_quant_mode="qdiff",\
         # sm_abit=config.quant.softmax.n_bits,\
     )

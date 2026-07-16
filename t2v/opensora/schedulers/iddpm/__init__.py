@@ -85,6 +85,8 @@ class IDDPM(SpacedDiffusion):
                     model_args['y'] = model_args['y'][choose_idx,:].permute([1,0,2,3,4]).reshape([len(choose_idx)*text_embeds_shape[1],\
                         text_embeds_shape[2],text_embeds_shape[3],text_embeds_shape[4]])
                     model_args['mask'] = model_args['mask'][choose_idx,:]
+                model_args['y'] = model_args['y'].to(device)
+                model_args['mask'] = model_args['mask'].to(device)
             else:
                 model_args = text_encoder.encode(prompts)
                 y_null = text_encoder.null(n)

@@ -9,6 +9,7 @@ from omegaconf import ListConfig
 
 from qdiff.quantizer.base_quantizer import WeightQuantizer, ActQuantizer, StraightThrough
 from qdiff.quantizer.dynamic_quantizer import DynamicActQuantizer
+from qdiff.research import normalize_research_config, trajectory_bin
 # import diffusers
 import math
 logger = logging.getLogger(__name__)
@@ -27,11 +28,13 @@ class QuantLayer(nn.Module):
     To activate quantization, please use set_quant_state function.
     """
     def __init__(self, org_module: Union[nn.Conv2d, nn.Linear, nn.Conv1d], weight_quant_params: dict = {},
-                 act_quant_params: dict = {}, disable_act_quant: bool = False, act_quant_mode: str = 'qdiff'):
+                 act_quant_params: dict = {}, disable_act_quant: bool = False, act_quant_mode: str = 'qdiff',
+                 research_config=None):
         super(QuantLayer, self).__init__()
         # self._orginal_module = org_module
         self.weight_quant_params = weight_quant_params
         self.act_quant_params = act_quant_params
+        self.research_config = normalize_research_config(research_config)
         
         if isinstance(org_module, nn.Conv2d):
             self.fwd_kwargs = dict(stride=org_module.stride, padding=org_module.padding,
@@ -81,6 +84,15 @@ class QuantLayer(nn.Module):
 
         self.activation_function = StraightThrough()
         self.ignore_reconstruction = False
+        self.trajectory_step_index = 0
+        self.trajectory_num_steps = 1
+        if self.research_config["diffusion_axis"] == "TAQ":
+            num_bins = self.research_config["taq"]["num_bins"]
+            self.taq_clip_logit = nn.Parameter(torch.full((num_bins,), 6.0))
+            self.taq_log_scale = nn.Parameter(torch.zeros(num_bins))
+        else:
+            self.register_parameter("taq_clip_logit", None)
+            self.register_parameter("taq_log_scale", None)
 
         self.extra_repr = org_module.extra_repr
         # for smooth quant
@@ -103,6 +115,23 @@ class QuantLayer(nn.Module):
             self.smooth_quant_alpha = smooth_quant_params.get("alpha", None)
             # assert self.timerange_num == len(self.smooth_quant_alpha)
             self.smooth_quant_running_stat = False
+
+    def set_trajectory_position(self, step_index, num_steps):
+        self.trajectory_step_index = int(step_index)
+        self.trajectory_num_steps = int(num_steps)
+
+    def apply_taq(self, inputs):
+        if self.taq_clip_logit is None:
+            return inputs
+        taq = self.research_config["taq"]
+        bin_id = trajectory_bin(self.trajectory_step_index, self.trajectory_num_steps, taq["num_bins"])
+        clip_ratio = taq["clip_min"] + (1.0 - taq["clip_min"]) * torch.sigmoid(self.taq_clip_logit[bin_id])
+        max_abs = inputs.detach().abs().amax(dim=-1, keepdim=True).clamp_min(1.0e-6)
+        inputs = inputs.clamp(-max_abs * clip_ratio, max_abs * clip_ratio)
+        if hasattr(self, "act_quantizer"):
+            scale = self.taq_log_scale[bin_id].exp().clamp(taq["scale_min"], taq["scale_max"])
+            self.act_quantizer.runtime_scale_multiplier = scale
+        return inputs
 
     def forward(self, input: torch.Tensor, scale: float = 1.0, split: int = 0, smooth_quant_enable: bool = False):
         # DEBUG_ONLY: test the time of init
@@ -164,6 +193,7 @@ class QuantLayer(nn.Module):
         # print(cur_timerange_id) # debug only
         
         if not self.disable_act_quant and self.act_quant:
+            input = self.apply_taq(input)
             if self.split != 0:
                 if self.act_quant_mode == 'qdiff':
                     input_0 = self.act_quantizer(input[:, :self.split, :, :])
@@ -179,12 +209,8 @@ class QuantLayer(nn.Module):
                 weight_1 = self.weight_quantizer_0(self.weight[:, self.split:, ...])
                 weight = torch.cat([weight_0, weight_1], dim=1)
             else:
-                E = torch.eye(self.weight.shape[1], device=input.device).to(self.loraB.weight.dtype)
-                lora_weight = self.loraB(self.loraA(E))
-                lora_weight = lora_weight.T
-                E_out = torch.eye(self.weight.shape[1], device=input.device).to(self.loraB_out.weight.dtype)
-                lora_weight_out = self.loraB_out(self.loraA_out(E_out))
-                lora_weight_out = lora_weight_out.T
+                lora_weight = self.loraB.weight @ self.loraA.weight
+                lora_weight_out = self.loraB_out.weight @ self.loraA_out.weight
                 if self.smooth_quant:
                     # during the weight init stage
                     if self.weight_quantizer.timestep_wise is None: # reinit the weight_quantizer

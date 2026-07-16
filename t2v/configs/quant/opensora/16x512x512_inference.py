@@ -2,14 +2,13 @@ num_frames = 16
 fps = 24 // 3
 image_size = (512, 512)
 
-# Define model
 model = dict(
     type="STDiT-XL/2",
     space_scale=1.0,
     time_scale=1.0,
-    enable_flashattn=False, # default is True
-    enable_layernorm_kernel=False, # default is True
-    from_pretrained="/home/zhouchongtian/quantization/Q-VDiT/logs/split_ckpt/OpenSora-v1-HQ-16x512x512-split.pth"
+    enable_flashattn=False,
+    enable_layernorm_kernel=False,
+    from_pretrained="/home/zhouchongtian/quantization/Q-VDiT/logs/split_ckpt/OpenSora-v1-HQ-16x512x512-split.pth",
 )
 vae = dict(
     type="VideoAutoencoderKL",
@@ -23,15 +22,8 @@ text_encoder = dict(
     save_pretrained="/home/zhouchongtian/quantization/models/DeepFloyd/t5-v1_1-xxl",
     model_max_length=120,
 )
-scheduler = dict(
-    type="iddpm",
-    num_sampling_steps=100,
-    cfg_scale=4.0,
-)
+scheduler = dict(type="iddpm", num_sampling_steps=100, cfg_scale=4.0)
 dtype = "fp32"
-
-# Others
 batch_size = 1
 seed = 42
 prompt_path = "./t2v/assets/texts/t2v_samples_10.txt"
-# save_dir = "./generated_videos/fp16"

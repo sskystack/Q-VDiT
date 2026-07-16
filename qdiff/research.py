@@ -1,0 +1,259 @@
+import math
+from collections.abc import Mapping
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def _plain_dict(value):
+    if value is None:
+        return {}
+    if isinstance(value, Mapping):
+        return {key: _plain_dict(item) if isinstance(item, Mapping) else item for key, item in value.items()}
+    if hasattr(value, "items"):
+        return {key: _plain_dict(item) if hasattr(item, "items") else item for key, item in value.items()}
+    return dict(value)
+
+
+def normalize_research_config(config=None):
+    config = _plain_dict(config)
+    method = _plain_dict(config.get("method"))
+    tarq = _plain_dict(config.get("tarq"))
+    mtd = _plain_dict(config.get("mtd"))
+    taq = _plain_dict(config.get("taq"))
+    return {
+        "token_axis": str(method.get("token_axis", "TQE")).upper(),
+        "frame_axis": str(method.get("frame_axis", "BASELINE")).upper(),
+        "diffusion_axis": str(method.get("diffusion_axis", "NONE")).upper(),
+        "tarq": {
+            "num_groups": int(tarq.get("num_groups", 4)),
+            "rank_per_group": int(tarq.get("rank_per_group", 1)),
+            "transport_size": int(tarq.get("transport_size", 16)),
+            "descriptor_dim": int(tarq.get("descriptor_dim", 8)),
+            "temperature": float(tarq.get("temperature", 0.07)),
+            "rank_budget": float(tarq.get("rank_budget", 1.0)),
+            "rank_budget_weight": float(tarq.get("rank_budget_weight", 1.0e-4)),
+        },
+        "mtd": {
+            "transport_size": int(mtd.get("transport_size", 16)),
+            "temperature": float(mtd.get("temperature", 0.07)),
+            "local_transport_weight": float(mtd.get("local_transport_weight", 1.0)),
+            "motion_residual_weight": float(mtd.get("motion_residual_weight", 1.0)),
+            "global_relation_weight": float(mtd.get("global_relation_weight", 0.1)),
+        },
+        "taq": {
+            "num_bins": int(taq.get("num_bins", 8)),
+            "trajectory_weight": float(taq.get("trajectory_weight", 1.0)),
+            "clip_min": float(taq.get("clip_min", 0.5)),
+            "scale_min": float(taq.get("scale_min", 0.5)),
+            "scale_max": float(taq.get("scale_max", 2.0)),
+        },
+    }
+
+
+def trajectory_bin(step_index, num_steps, num_bins):
+    if num_steps <= 1:
+        return 0
+    progress = max(0.0, min(1.0, float(step_index) / float(num_steps - 1)))
+    return min(num_bins - 1, int(progress * num_bins))
+
+
+def set_trajectory_position(module, step_index, num_steps):
+    for child in module.modules():
+        if hasattr(child, "set_trajectory_position"):
+            child.set_trajectory_position(step_index, num_steps)
+
+
+def sample_trajectory_pair_indices(total_size, n_steps, samples_per_step, iters, batch_size, device, num_bins=8):
+    if batch_size % 2:
+        raise ValueError("TAQ trajectory batches must have an even batch size")
+    if total_size < n_steps * samples_per_step:
+        raise ValueError("Calibration cache is smaller than the configured trajectory layout")
+    valid_steps = []
+    for step in range(n_steps - 1):
+        if trajectory_bin(step, n_steps, num_bins) == trajectory_bin(step + 1, n_steps, num_bins):
+            valid_steps.append(step)
+    if not valid_steps:
+        raise ValueError("No adjacent calibration steps fall inside the same TAQ bin")
+    valid_steps = torch.tensor(valid_steps, device=device)
+    step_ids = valid_steps[torch.randint(0, valid_steps.numel(), (iters,), device=device)]
+    pair_count = batch_size // 2
+    sample_ids = torch.randint(0, samples_per_step, (iters, pair_count), device=device)
+    base = step_ids[:, None] * samples_per_step + sample_ids
+    paired = base + samples_per_step
+    return torch.stack((base, paired), dim=-1).reshape(iters, batch_size)
+
+
+def _compact_transport_features(video, transport_size, descriptor_dim, temperature):
+    # video: [B, T, H, W, C]
+    batch, frames, height, width, channels = video.shape
+    size = min(transport_size, height, width)
+    descriptors = video[..., : min(descriptor_dim, channels)].permute(0, 1, 4, 2, 3)
+    descriptors = descriptors.reshape(batch * frames, descriptors.shape[2], height, width)
+    descriptors = F.adaptive_avg_pool2d(descriptors, (size, size))
+    descriptors = descriptors.reshape(batch, frames, -1, size, size)
+    descriptors = F.normalize(descriptors, dim=2, eps=1.0e-6)
+
+    if frames == 1:
+        zeros = video.new_zeros(batch, 1, size, size, 3)
+        return zeros
+
+    current = descriptors[:, :-1]
+    following = descriptors[:, 1:]
+    current_flat = current.permute(0, 1, 3, 4, 2).reshape(batch * (frames - 1), size * size, -1)
+    following_flat = following.reshape(batch * (frames - 1), following.shape[2], size, size)
+    neighbours = F.unfold(following_flat, kernel_size=3, padding=1)
+    neighbours = neighbours.reshape(batch * (frames - 1), -1, 9, size * size).permute(0, 3, 2, 1)
+    logits = (current_flat[:, :, None, :] * neighbours).sum(-1) / temperature
+    probs = F.softmax(logits, dim=-1)
+    offsets = video.new_tensor(
+        [[-1, -1], [-1, 0], [-1, 1], [0, -1], [0, 0], [0, 1], [1, -1], [1, 0], [1, 1]]
+    )
+    displacement = probs @ offsets
+    magnitude = displacement.square().sum(-1).sqrt()
+    confidence = probs.max(dim=-1).values
+    entropy = -(probs.clamp_min(1.0e-8).log() * probs).sum(-1) / math.log(9.0)
+    features = torch.stack((magnitude, confidence, entropy), dim=-1)
+    features = features.reshape(batch, frames - 1, size, size, 3)
+    first = features[:, :1]
+    return torch.cat((first, features), dim=1)
+
+
+class TrackAwareResidual(nn.Module):
+    def __init__(self, in_features, out_features, research_config):
+        super().__init__()
+        config = normalize_research_config(research_config)
+        tarq = config["tarq"]
+        self.num_groups = tarq["num_groups"]
+        self.rank_per_group = tarq["rank_per_group"]
+        self.transport_size = tarq["transport_size"]
+        self.descriptor_dim = tarq["descriptor_dim"]
+        self.base_temperature = tarq["temperature"]
+        self.rank_budget = tarq["rank_budget"]
+        self.taq_enabled = config["diffusion_axis"] == "TAQ"
+        self.num_bins = config["taq"]["num_bins"]
+        self.down = nn.Parameter(torch.empty(self.num_groups, self.rank_per_group, in_features))
+        self.up = nn.Parameter(torch.zeros(self.num_groups, out_features, self.rank_per_group))
+        self.gate = nn.Linear(3, self.num_groups)
+        nn.init.kaiming_uniform_(self.down, a=math.sqrt(5))
+        nn.init.zeros_(self.gate.weight)
+        nn.init.zeros_(self.gate.bias)
+        if self.taq_enabled:
+            self.taq_log_temperature = nn.Parameter(torch.zeros(self.num_bins))
+            self.taq_rank_logit = nn.Parameter(torch.zeros(self.num_bins))
+        else:
+            self.register_parameter("taq_log_temperature", None)
+            self.register_parameter("taq_rank_logit", None)
+        self.trajectory_step_index = 0
+        self.trajectory_num_steps = 1
+        self.last_budget_loss = None
+
+    def set_trajectory_position(self, step_index, num_steps):
+        self.trajectory_step_index = int(step_index)
+        self.trajectory_num_steps = int(num_steps)
+
+    def _temperature_and_scale(self):
+        if not self.taq_enabled:
+            return self.base_temperature, 1.0
+        bin_id = trajectory_bin(self.trajectory_step_index, self.trajectory_num_steps, self.num_bins)
+        temperature = self.base_temperature * self.taq_log_temperature[bin_id].exp().clamp(0.5, 2.0)
+        rank_scale = 0.5 + torch.sigmoid(self.taq_rank_logit[bin_id])
+        return temperature, rank_scale
+
+    def forward(self, inputs, batch, frames, spatial_tokens, layout):
+        side = int(math.sqrt(spatial_tokens))
+        if side * side != spatial_tokens:
+            raise ValueError(f"TARQ requires a square spatial token grid, got {spatial_tokens}")
+        if layout == "spatial":
+            video = inputs.reshape(batch, frames, spatial_tokens, inputs.shape[-1])
+        elif layout == "temporal":
+            video = inputs.reshape(batch, spatial_tokens, frames, inputs.shape[-1]).permute(0, 2, 1, 3)
+        else:
+            raise ValueError(f"Unknown TARQ layout: {layout}")
+        video_grid = video.reshape(batch, frames, side, side, inputs.shape[-1])
+        temperature, rank_scale = self._temperature_and_scale()
+        transport_temperature = float(temperature.detach()) if torch.is_tensor(temperature) else float(temperature)
+        motion = _compact_transport_features(
+            video_grid, self.transport_size, self.descriptor_dim, transport_temperature
+        )
+        motion = motion.permute(0, 1, 4, 2, 3).reshape(batch * frames, 3, motion.shape[2], motion.shape[3])
+        motion = F.interpolate(motion, size=(side, side), mode="bilinear", align_corners=False)
+        motion = motion.reshape(batch, frames, 3, spatial_tokens).permute(0, 1, 3, 2)
+        gate_logits = self.gate(motion) / temperature
+        gates = F.softmax(gate_logits, dim=-1)
+        effective_groups = torch.exp(-(gates.clamp_min(1.0e-8) * gates.clamp_min(1.0e-8).log()).sum(-1))
+        self.last_budget_loss = (effective_groups.mean() - self.rank_budget).square()
+
+        correction = torch.zeros(*video.shape[:-1], self.up.shape[1], device=inputs.device, dtype=inputs.dtype)
+        for group in range(self.num_groups):
+            low_rank = F.linear(video, self.down[group].to(inputs.dtype))
+            low_rank = F.linear(low_rank, self.up[group].to(inputs.dtype))
+            correction = correction + gates[..., group : group + 1].to(inputs.dtype) * low_rank
+        correction = correction * rank_scale
+        if layout == "spatial":
+            return correction.reshape(batch * frames, spatial_tokens, -1)
+        return correction.permute(0, 2, 1, 3).reshape(batch * spatial_tokens, frames, -1)
+
+
+def collect_rank_budget_loss(module):
+    losses = [child.last_budget_loss for child in module.modules() if isinstance(child, TrackAwareResidual)]
+    losses = [loss for loss in losses if loss is not None]
+    if not losses:
+        parameter = next(module.parameters(), None)
+        return torch.tensor(0.0, device=parameter.device if parameter is not None else "cpu")
+    return torch.stack(losses).mean()
+
+
+def _local_transport_distribution(features, size, temperature):
+    batch, channels, frames, height, width = features.shape
+    pooled = features.permute(0, 2, 1, 3, 4).reshape(batch * frames, channels, height, width)
+    pooled = F.adaptive_avg_pool2d(pooled, (size, size)).reshape(batch, frames, channels, size, size)
+    pooled = F.normalize(pooled, dim=2, eps=1.0e-6)
+    current = pooled[:, :-1]
+    following = pooled[:, 1:]
+    current_flat = current.permute(0, 1, 3, 4, 2).reshape(batch * (frames - 1), size * size, channels)
+    following_flat = following.reshape(batch * (frames - 1), channels, size, size)
+    neighbours = F.unfold(following_flat, kernel_size=3, padding=1)
+    neighbours = neighbours.reshape(batch * (frames - 1), channels, 9, size * size).permute(0, 3, 2, 1)
+    logits = (current_flat[:, :, None, :] * neighbours).sum(-1) / temperature
+    return F.softmax(logits, dim=-1), current_flat, neighbours
+
+
+def motion_transport_distillation(pred, target, research_config):
+    config = normalize_research_config(research_config)
+    if config["frame_axis"] != "MTD" or pred.ndim != 5 or pred.shape[2] < 2:
+        return pred.new_tensor(0.0)
+    mtd = config["mtd"]
+    size = min(mtd["transport_size"], pred.shape[-2], pred.shape[-1])
+    pred_probs, pred_current, pred_neighbours = _local_transport_distribution(pred, size, mtd["temperature"])
+    with torch.no_grad():
+        target_probs, target_current, target_neighbours = _local_transport_distribution(target, size, mtd["temperature"])
+    local_kl = F.kl_div(pred_probs.clamp_min(1.0e-8).log(), target_probs, reduction="batchmean")
+    pred_transport = (pred_probs[..., None] * pred_neighbours).sum(-2) - pred_current
+    target_transport = (target_probs[..., None] * target_neighbours).sum(-2) - target_current
+    motion_residual = F.smooth_l1_loss(pred_transport, target_transport)
+
+    pred_summary = F.normalize(pred.mean(dim=(-1, -2)).transpose(1, 2), dim=-1, eps=1.0e-6)
+    target_summary = F.normalize(target.mean(dim=(-1, -2)).transpose(1, 2), dim=-1, eps=1.0e-6)
+    pred_relation = pred_summary @ pred_summary.transpose(1, 2)
+    target_relation = target_summary @ target_summary.transpose(1, 2)
+    global_relation = F.kl_div(
+        F.log_softmax(pred_relation, dim=-1), F.softmax(target_relation, dim=-1), reduction="batchmean"
+    )
+    return (
+        mtd["local_transport_weight"] * local_kl
+        + mtd["motion_residual_weight"] * motion_residual
+        + mtd["global_relation_weight"] * global_relation
+    )
+
+
+def trajectory_consistency_loss(pred, target, research_config):
+    config = normalize_research_config(research_config)
+    if config["diffusion_axis"] != "TAQ" or pred.shape[0] < 2 or pred.shape[0] % 2:
+        return pred.new_tensor(0.0)
+    pred_eps = pred[:, :3] if pred.ndim == 5 else pred
+    target_eps = target[:, :3] if target.ndim == 5 else target
+    pred_delta = pred_eps[1::2] - pred_eps[0::2]
+    target_delta = target_eps[1::2] - target_eps[0::2]
+    return F.mse_loss(pred_delta, target_delta)

@@ -609,7 +609,7 @@ class GaussianDiffusion:
         final = None
         if return_trajectory:
             data = {}
-            calib_data_key = ["xs", "ts", "cond_emb", "mask"]
+            calib_data_key = ["xs", "ts", "sampling_step", "cond_emb", "mask"]
             out_data = []
         for sample in self.ddim_sample_loop_progressive(
             model,
@@ -673,14 +673,19 @@ class GaussianDiffusion:
         key_org = None  # for time_step_mixed_precision
         fp_layer_list_org = None
         
-        for i in indices:
+        num_sampling_steps = len(indices)
+        for sampling_step_index, i in enumerate(indices):
             t = th.tensor([i] * shape[0], device=device)
             with th.no_grad():
+                qnn = model.args[0]
+                if hasattr(qnn, "set_trajectory_position"):
+                    qnn.set_trajectory_position(sampling_step_index, num_sampling_steps)
                 if return_trajectory:
                     calib_data = {}
                     map_tensor = th.tensor(self.timestep_map, device=t.device, dtype=t.dtype)
                     new_ts = map_tensor[t]
                     calib_data ["ts"] = new_ts
+                    calib_data["sampling_step"] = th.full_like(new_ts, sampling_step_index)
                     calib_data ["cond_emb"] = model_kwargs["y"]
                     calib_data ["xs"] = img
                     mask = model_kwargs["mask"]
@@ -689,7 +694,6 @@ class GaussianDiffusion:
                     calib_data["mask"] = mask
                 
                 # timestep wise quant
-                qnn = model.args[0]
                 if getattr(qnn, "timestep_wise_quant", False):
                     if not qnn.layer_wise_quant and not qnn.group_wise_quant and not qnn.block_group_wise_quant:
                         if i <= qnn.quant_start_t and i >= qnn.quant_end_t:

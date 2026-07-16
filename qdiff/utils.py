@@ -11,6 +11,12 @@ from qdiff.models.quant_layer import QuantLayer
 from qdiff.models.quant_block import BaseQuantBlock
 from qdiff.models.quant_model import QuantModel
 from qdiff.quantizer.base_quantizer import BaseQuantizer, lp_loss
+from qdiff.research import (
+    collect_rank_budget_loss,
+    motion_transport_distillation,
+    normalize_research_config,
+    trajectory_consistency_loss,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +145,7 @@ class LossFunction:
                  module_type='layer',
                  use_reconstruction_loss=False,
                  use_round_loss=False,
+                 research_config=None,
                  ):
 
         self.module = module
@@ -152,6 +159,7 @@ class LossFunction:
         self.p = p
         self.use_reconstruction_loss = use_reconstruction_loss
         self.use_round_loss = use_round_loss
+        self.research_config = normalize_research_config(research_config)
 
         self.temp_decay = LinearTempDecay(iters, rel_start_decay=warmup + (1 - warmup) * decay_start,
                                           start_b=b_range[0], end_b=b_range[1])
@@ -193,6 +201,10 @@ class LossFunction:
         else:
             reconstruction_loss = 0.
 
+        motion_loss = motion_transport_distillation(pred, tgt, self.research_config)
+        trajectory_loss = trajectory_consistency_loss(pred, tgt, self.research_config)
+        rank_budget_loss = collect_rank_budget_loss(self.module)
+
         b = self.temp_decay(self.count)
         if self.use_round_loss:
             if self.count < self.loss_start or self.round_loss_type == 'none':
@@ -216,11 +228,19 @@ class LossFunction:
 
         total_loss += reconstruction_loss
         total_loss += round_loss
+        total_loss += motion_loss
+        total_loss += self.research_config["taq"]["trajectory_weight"] * trajectory_loss
+        total_loss += self.research_config["tarq"]["rank_budget_weight"] * rank_budget_loss
         if self.count % 100 == 0:
             reconstruction_loss = -1 if not self.use_reconstruction_loss else reconstruction_loss
             round_loss = -1 if not self.use_round_loss else round_loss
-            logger.info('Total loss:\t{:.6f} (rec:{:.6f}, round:{:.6})\tb={:.2f}\tcount={}'.format(
-                  float(total_loss), float(reconstruction_loss), float(round_loss), b, self.count))
+            logger.info(
+                'Total loss:\t{:.6f} (rec:{:.6f}, motion:{:.6f}, trajectory:{:.6f}, rank:{:.6f}, round:{:.6})'
+                '\tb={:.2f}\tcount={}'.format(
+                    float(total_loss), float(reconstruction_loss), float(motion_loss), float(trajectory_loss),
+                    float(rank_budget_loss), float(round_loss), b, self.count
+                )
+            )
         return total_loss
 
 

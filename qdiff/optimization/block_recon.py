@@ -9,6 +9,7 @@ from qdiff.models.quant_block import BaseQuantBlock
 from qdiff.quantizer.base_quantizer import StraightThrough
 # from qdiff.quantizer.base_quantizer import AdaRoundQuantizer
 from qdiff.utils import save_grad_data, save_in_out_data, LossFunction
+from qdiff.research import normalize_research_config, sample_trajectory_pair_indices, set_trajectory_position
 from torch.cuda.amp import GradScaler, autocast
 from opensora.acceleration.checkpoint import set_grad_checkpoint
 
@@ -175,10 +176,13 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock, calib_data: t
                 if not optim_flag:
                     continue'''
                 # params_ += [param for name, param in layer_.named_parameters() if 'lora' in name]
-                if isinstance(layer_, QuantTemporalAttnLinear):
-                    params_ = [param for name, param in layer_.named_parameters() if ('lora' in name and 'minus' not in name) or 'mask' in name]
-                else:
-                    params_ = [param for name, param in layer_.named_parameters() if ('lora' in name and 'minus' not in name)]
+                params_ = [
+                    param for name, param in layer_.named_parameters()
+                    if ('lora' in name and 'minus' not in name)
+                    or 'mask' in name
+                    or 'tarq' in name
+                    or 'taq_' in name
+                ]
                 if layer_.weight_quantizer.delta is None:
                     continue
                 # avg_delta = torch.sum(layer_.weight_quantizer.delta) / torch.numel(layer_.weight_quantizer.delta)
@@ -215,7 +219,11 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock, calib_data: t
     config_loss['module_type'] = 'block'
     config_loss['use_reconstruction_loss'] = ('delta' in param_types or 'delta_out' in param_types)
     config_loss['use_round_loss'] = 'alpha' in param_types
+    config_loss['research_config'] = config
     loss_func = LossFunction(block, **config_loss)
+
+    research_config = normalize_research_config(config)
+    taq_enabled = research_config['diffusion_axis'] == 'TAQ'
 
     # move to gpu device
     # sample_idxs = torch.randint(low=0,high=cached_inps.shape[0],size=(iters,batch_size))
@@ -226,16 +234,28 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock, calib_data: t
                 idxs_list.append(torch.randint(low=0,high=cached_inps[1][i].shape[0],size=(iters,1), device=cached_inps[1][i].device))
             pmp_idxs = torch.randint(low=0,high=len(cached_outs),size=(iters, 1), device=cached_inps[0][0].device)
         else:
-            sample_idxs = torch.randint(low=0,high=cached_inps[0].shape[0],size=(iters,batch_size), device=cached_inps[0].device)
+            if taq_enabled:
+                sample_idxs = sample_trajectory_pair_indices(
+                    cached_inps[0].shape[0], config.calib_data.n_steps, config.calib_data.n_samples * 2,
+                    iters, batch_size, cached_inps[0].device, research_config['taq']['num_bins']
+                )
+            else:
+                sample_idxs = torch.randint(low=0,high=cached_inps[0].shape[0],size=(iters,batch_size), device=cached_inps[0].device)
     else:
-        sample_idxs = torch.randint(low=0,high=cached_inps.shape[0],size=(iters,batch_size), device=cached_inps.device)
+        if taq_enabled:
+            sample_idxs = sample_trajectory_pair_indices(
+                cached_inps.shape[0], config.calib_data.n_steps, config.calib_data.n_samples * 2,
+                iters, batch_size, cached_inps.device, research_config['taq']['num_bins']
+            )
+        else:
+            sample_idxs = torch.randint(low=0,high=cached_inps.shape[0],size=(iters,batch_size), device=cached_inps.device)
     torch.set_grad_enabled(True)
     # import ipdb; ipdb.set_trace()
     # iters = 16 # debug
     if enable_fp32:
         scaler = GradScaler()
     for name, param in block.named_parameters():
-        if ('lora' in name and 'minus' not in name) or 'delta' in name or 'mask' in name:
+        if ('lora' in name and 'minus' not in name) or 'delta' in name or 'mask' in name or 'tarq' in name or 'taq_' in name:
         # if 'lora' in name or 'zero_point' in name or 'delta' in name or 'zp_list' in name:
             param.requires_grad = True
         else:
@@ -257,6 +277,9 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock, calib_data: t
             idx = idxs_list[pmp_id][i]
         else:
             idx = sample_idxs[i,:]
+        if taq_enabled and not isinstance(cached_outs, list):
+            trajectory_step = int(idx[0].item()) // (config.calib_data.n_samples * 2)
+            set_trajectory_position(block, trajectory_step, config.calib_data.n_steps)
         # import ipdb; ipdb.set_trace()
         if isinstance(cached_inps, list):
             # 这个对应多输入

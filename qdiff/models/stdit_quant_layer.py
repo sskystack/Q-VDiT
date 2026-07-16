@@ -2,6 +2,7 @@ import logging
 import torch
 from qdiff.quantizer.base_quantizer import WeightQuantizer, ActQuantizer, StraightThrough, round_ste
 from qdiff.models.quant_layer import QuantLayer, find_interval
+from qdiff.research import TrackAwareResidual
 from omegaconf import ListConfig
 import copy
 import torch.nn as nn
@@ -15,6 +16,9 @@ class QuantSpatialAttnLinear(QuantLayer):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.tarq = None
+        if self.research_config["token_axis"] == "TARQ":
+            self.tarq = TrackAwareResidual(self.in_features, self.weight.shape[0], self.research_config)
         '''weight_quant_params_res = copy.deepcopy(self.weight_quant_params)
         weight_quant_params_res.n_bits = 1
         weight_quant_params_res.mixed_precision = None
@@ -76,6 +80,7 @@ class QuantSpatialAttnLinear(QuantLayer):
         if not self.disable_act_quant and self.act_quant:
             # convert the dim into [bs, n_token, c]
             input = input.reshape([BS,T*S,C])
+            input = self.apply_taq(input)
             input = self.act_quantizer(input)
             # convert back
             input = input.reshape([BS*T,S,C])
@@ -86,12 +91,8 @@ class QuantSpatialAttnLinear(QuantLayer):
                 weight_1 = self.weight_quantizer_0(self.weight[:, self.split:, ...])
                 weight = torch.cat([weight_0, weight_1], dim=1)
             else:
-                E = torch.eye(self.weight.shape[1], device=input.device).to(self.loraB.weight.dtype)
-                lora_weight = self.loraB(self.loraA(E))
-                lora_weight = lora_weight.T
-                E_out = torch.eye(self.weight.shape[1], device=input.device).to(self.loraB_out.weight.dtype)
-                lora_weight_out = self.loraB_out(self.loraA_out(E_out))
-                lora_weight_out = lora_weight_out.T
+                lora_weight = self.loraB.weight @ self.loraA.weight
+                lora_weight_out = self.loraB_out.weight @ self.loraA_out.weight
                 if self.smooth_quant:
                     # during the weight init stage
                     if self.weight_quantizer.timestep_wise is None: # reinit the weight_quantizer
@@ -101,7 +102,8 @@ class QuantSpatialAttnLinear(QuantLayer):
                     weight = self.weight_quantizer(self.weight * channel_wise_scale + lora_weight)
                 else:
                     weight = self.weight_quantizer(self.weight + lora_weight)
-                weight = weight + lora_weight_out
+                if self.tarq is None:
+                    weight = weight + lora_weight_out
             bias = self.bias
         else:
             if self.smooth_quant:
@@ -115,6 +117,8 @@ class QuantSpatialAttnLinear(QuantLayer):
 
         # import ipdb; ipdb.set_trace()
         out = self.fwd_func(input, weight, bias, **self.fwd_kwargs)
+        if self.weight_quant and self.tarq is not None:
+            out = out + self.tarq(input, BS, T, S, layout="spatial")
         out = self.activation_function(out)
 
         if torch.isnan(out).any():
@@ -129,6 +133,9 @@ class QuantTemporalAttnLinear(QuantLayer):
         super().__init__(*args, **kwargs)
         T = self.act_quant_params['n_temporal_token']
         self.mask = nn.Parameter(torch.ones([1, T, 1]))
+        self.tarq = None
+        if self.research_config["token_axis"] == "TARQ":
+            self.tarq = TrackAwareResidual(self.in_features, self.weight.shape[0], self.research_config)
 
     def forward(self, input: torch.Tensor, scale: float = 1.0, split: int = 0):
         # check the n_spatial/temporal_token num in act_quant_config is True
@@ -186,6 +193,7 @@ class QuantTemporalAttnLinear(QuantLayer):
         if not self.disable_act_quant and self.act_quant:
             # convert the dim into [bs, n_token, c]
             input = input.reshape([BS,S*T,C])
+            input = self.apply_taq(input)
             input = self.act_quantizer(input)
             # convert back
             input = input.reshape([BS*S,T,C])
@@ -196,12 +204,8 @@ class QuantTemporalAttnLinear(QuantLayer):
                 weight_1 = self.weight_quantizer_0(self.weight[:, self.split:, ...])
                 weight = torch.cat([weight_0, weight_1], dim=1)
             else:
-                E = torch.eye(self.weight.shape[1], device=input.device).to(self.loraB.weight.dtype)
-                lora_weight = self.loraB(self.loraA(E))
-                lora_weight = lora_weight.T
-                E_out = torch.eye(self.weight.shape[1], device=input.device).to(self.loraB_out.weight.dtype)
-                lora_weight_out = self.loraB_out(self.loraA_out(E_out))
-                lora_weight_out = lora_weight_out.T
+                lora_weight = self.loraB.weight @ self.loraA.weight
+                lora_weight_out = self.loraB_out.weight @ self.loraA_out.weight
                 if self.smooth_quant:
                     # during the weight init stage
                     if self.weight_quantizer.timestep_wise is None: # reinit the weight_quantizer
@@ -211,7 +215,8 @@ class QuantTemporalAttnLinear(QuantLayer):
                     weight = self.weight_quantizer(self.weight * channel_wise_scale + lora_weight)
                 else:
                     weight = self.weight_quantizer(self.weight + lora_weight)
-                weight = weight + lora_weight_out
+                if self.tarq is None:
+                    weight = weight + lora_weight_out
             bias = self.bias
         else:
             if self.smooth_quant:
@@ -224,10 +229,12 @@ class QuantTemporalAttnLinear(QuantLayer):
             weight = weight.to(torch.float16)
 
         out = self.fwd_func(input, weight, bias, **self.fwd_kwargs)
-        if self.weight_quant:
+        if self.weight_quant and self.tarq is None:
             out_lora = self.fwd_func(input, lora_weight_out, **self.fwd_kwargs)
             out_lora = out_lora * self.mask
             out = out + out_lora
+        elif self.weight_quant:
+            out = out + self.tarq(input, BS, T, S, layout="temporal")
         out = self.activation_function(out)
 
         if torch.isnan(out).any():
@@ -312,19 +319,23 @@ class QuantCrossAttnLinear(QuantLayer):
         if not self.disable_act_quant and self.act_quant:
             # convert the dim into [bs, n_token, c]
             if layer_type == 'q':
+                input = self.apply_taq(input)
                 input = self.act_quantizer(input)
             elif layer_type == 'kv':
                 # INFO: when mask_select=True
                 # it only supports dynamic quant
                 if not self.act_quant_params.get('dynamic',False):
                     if self.act_quant_params.per_group is False:  # no need to reshape for tensor-wise quant
+                        input = self.apply_taq(input)
                         input = self.act_quantizer(input)
                     else:
                         input = input.reshape([BS,n_prompt,C])
+                        input = self.apply_taq(input)
                         input = self.act_quantizer(input)
                         input = input.reshape([1,BS*n_prompt,C])
                 else:
                     # directly assign N_batch*prompt quant_params for each token
+                    input = self.apply_taq(input)
                     input = self.act_quantizer(input)
 
         if self.weight_quant:
@@ -333,12 +344,8 @@ class QuantCrossAttnLinear(QuantLayer):
                 weight_1 = self.weight_quantizer_0(self.weight[:, self.split:, ...])
                 weight = torch.cat([weight_0, weight_1], dim=1)
             else:
-                E = torch.eye(self.weight.shape[1], device=input.device).to(self.loraB.weight.dtype)
-                lora_weight = self.loraB(self.loraA(E))
-                lora_weight = lora_weight.T
-                E_out = torch.eye(self.weight.shape[1], device=input.device).to(self.loraB_out.weight.dtype)
-                lora_weight_out = self.loraB_out(self.loraA_out(E_out))
-                lora_weight_out = lora_weight_out.T
+                lora_weight = self.loraB.weight @ self.loraA.weight
+                lora_weight_out = self.loraB_out.weight @ self.loraA_out.weight
                 if self.smooth_quant:
                     # during the weight init stage
                     if self.weight_quantizer.timestep_wise is None: # reinit the weight_quantizer
@@ -368,5 +375,3 @@ class QuantCrossAttnLinear(QuantLayer):
             import ipdb; ipdb.set_trace()
 
         return out
-
-

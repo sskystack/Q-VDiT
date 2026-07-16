@@ -12,6 +12,7 @@ class DynamicActQuantizer(ActQuantizer):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.runtime_scale_multiplier = None
 
     def forward(self, x: torch.Tensor):
         assert self.init_done is True   # for dynamic act quantizer, no init_quant_params stage
@@ -20,6 +21,11 @@ class DynamicActQuantizer(ActQuantizer):
 
         # INFO: for dynaimc calculateing quant_params, no handling of mixed_precision/timestep_wise, calculating online
         self.init_quant_params(x, self.per_group, momentum=self.running_stat)
+        if self.runtime_scale_multiplier is not None:
+            scale = self.runtime_scale_multiplier.to(device=self.delta.device, dtype=self.delta.dtype)
+            self.delta = self.delta * scale
+            if not self.sym:
+                self.zero_point = torch.round(self.zero_point / scale)
         
         # self.delta = self.delta_list[self.bit_idx, 0]
         # self.zero_point = self.zero_point_list[self.bit_idx, 0]
@@ -43,5 +49,4 @@ class DynamicActQuantizer(ActQuantizer):
         # import ipdb; ipdb.set_trace()
         # x_quant_ = self.rounding(x)
         return x_dequant
-
 

@@ -151,6 +151,8 @@ def main():
         model=model, \
         weight_quant_params=wq_params,\
         act_quant_params=aq_params,\
+        model_type=config.model.model_type,\
+        research_config=config,\
     )
     qnn.cuda()
     qnn.eval()
@@ -408,7 +410,8 @@ def main():
         if not weight_optimization:
             logger.info("No quant parmas, skip optimizing weight quant parameters")
         else:
-            qnn.set_quant_state(True, False)  # use FP activation
+            taq_enabled = str(config.get("method", {}).get("diffusion_axis", "NONE")).upper() == "TAQ"
+            qnn.set_quant_state(True, taq_enabled)
             opt_target = 'weight'
             # --- unpack the config ----
             param_types = list(config.quant.weight.optimization.params.keys())

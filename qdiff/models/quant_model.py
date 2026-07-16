@@ -8,6 +8,7 @@ from qdiff.models.stdit_quant_layer import QuantSpatialAttnLinear, QuantTemporal
 from qdiff.models.dit_quant_layer import QuantAttnLinearImg, QuantCrossAttnLinearImg
 from qdiff.models.quant_block import BaseQuantBlock, TransformerBlock, QuantTransformerBlock, get_specials
 from qdiff.quantizer.base_quantizer import StraightThrough, BaseQuantizer, WeightQuantizer, ActQuantizer
+from qdiff.research import normalize_research_config
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +37,8 @@ def pattern_in(text, pattern):
     return False
 
 class QuantModel(nn.Module):
-    def __init__(self, model: nn.Module, weight_quant_params: dict = {}, act_quant_params: dict = {}, model_type="opensora", **kwargs):
+    def __init__(self, model: nn.Module, weight_quant_params: dict = {}, act_quant_params: dict = {}, model_type="opensora",
+                 research_config=None, **kwargs):
         super().__init__()
         self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         # self.dtype = torch.float32
@@ -44,6 +46,7 @@ class QuantModel(nn.Module):
         self.weight_quant = False if weight_quant_params is None else True
         self.act_quant = False if act_quant_params is None else True
         self.model_type = model_type
+        self.research_config = normalize_research_config(research_config)
         self.timestep_wise = act_quant_params.get('timestep_wise', False)
         self.specials = get_specials(model_type)
 
@@ -78,23 +81,23 @@ class QuantModel(nn.Module):
                 if '.attn.' in full_name:
                     if self.model_type == 'opensora':
                         setattr(module, name, QuantSpatialAttnLinear(\
-                            child_module, weight_quant_params, act_quant_params))
+                            child_module, weight_quant_params, act_quant_params, research_config=self.research_config))
                     elif self.model_type == 'pixart':
                         setattr(module, name, QuantAttnLinearImg(\
-                            child_module, weight_quant_params, act_quant_params))
+                            child_module, weight_quant_params, act_quant_params, research_config=self.research_config))
                 elif 'cross_attn' in full_name:
                     if self.model_type == 'opensora':
                         setattr(module, name, QuantCrossAttnLinear(\
-                            child_module, weight_quant_params, act_quant_params))
+                            child_module, weight_quant_params, act_quant_params, research_config=self.research_config))
                     elif self.model_type == 'pixart':
                         setattr(module, name, QuantCrossAttnLinearImg(\
-                            child_module, weight_quant_params, act_quant_params))
+                            child_module, weight_quant_params, act_quant_params, research_config=self.research_config))
                 elif 'attn_temp' in full_name:
                     setattr(module, name, QuantTemporalAttnLinear(\
-                        child_module, weight_quant_params, act_quant_params))
+                        child_module, weight_quant_params, act_quant_params, research_config=self.research_config))
                 else:
                     setattr(module, name, QuantLayer(
-                        child_module, weight_quant_params, act_quant_params))
+                        child_module, weight_quant_params, act_quant_params, research_config=self.research_config))
                 prev_quantmodule = getattr(module, name)
                 # logger.info(f"\n origional module: {name}:{tmp_module}, \n new module {prev_quantmodule}")
             elif isinstance(child_module, StraightThrough):
@@ -182,6 +185,13 @@ class QuantModel(nn.Module):
             else:
                 self.set_timestep_id_for_quantlayer(t, module=module_)
 
+    def set_trajectory_position(self, step_index, num_steps):
+        for module in self.model.modules():
+            if isinstance(module, QuantLayer):
+                module.set_trajectory_position(step_index, num_steps)
+            elif hasattr(module, "set_trajectory_position"):
+                module.set_trajectory_position(step_index, num_steps)
+
 
     def repeat_timestep_wise_quant_params(self, ts, module=None):
         if module is None:
@@ -221,7 +231,8 @@ class QuantModel(nn.Module):
 
     def get_quant_params_dict(self, module=None, prefix="", dtype=torch.float32):
         # iter through all quantizers, get the buffers
-        if module is None:
+        root_call = module is None
+        if root_call:
             module = self.model
             self.quant_params_dict = {}
         quantizer_type = (BaseQuantizer, QuantLayer)
@@ -252,6 +263,12 @@ class QuantModel(nn.Module):
             else:
                 self.get_quant_params_dict(module=module_, prefix=full_name+'.')
 
+        if root_call:
+            self.quant_params_dict["__research_state__"] = {
+                name: parameter.detach().to(dtype)
+                for name, parameter in self.model.named_parameters()
+                if ".tarq." in name or "taq_" in name
+            }
         return self.quant_params_dict
 
 
@@ -260,7 +277,8 @@ class QuantModel(nn.Module):
         # quant_parma_dict: ['conv_in.weight_quantizer'] is a tuple, 1st is _bufferes, 2nd is _params()]
         # load_buffer_only: when `quantized_inference`, should only load the buffers (the saved ckpt should be all buffers)
         # when resuming quantization, load both the buffers and the parameters
-        if module is None:
+        root_call = module is None
+        if root_call:
             module = self.model
 
         quantizer_type = (BaseQuantizer, QuantLayer)
@@ -300,6 +318,12 @@ class QuantModel(nn.Module):
                             setattr(module_, name, quant_params.to(dtype) if quant_params is not None else None)
             else:
                 self.set_quant_params_dict(quant_params_dict=quant_params_dict, module=module_)
+        if root_call and "__research_state__" in quant_params_dict:
+            current_parameters = dict(self.model.named_parameters())
+            for name, value in quant_params_dict["__research_state__"].items():
+                if name not in current_parameters:
+                    raise KeyError(f"Research checkpoint parameter is missing from the configured model: {name}")
+                current_parameters[name].data.copy_(value.to(current_parameters[name].device, current_parameters[name].dtype))
 
 
     def replace_quant_buffer_with_parameter(self, opt_d, module=None):
