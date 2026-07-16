@@ -7,6 +7,7 @@ model = dict(
     space_scale=1.0,
     time_scale=1.0,
     enable_flashattn=False,
+    enable_memory_efficient_attention=True,
     enable_layernorm_kernel=False,
     from_pretrained="/home/zhouchongtian/quantization/Q-VDiT/logs/split_ckpt/OpenSora-v1-HQ-16x512x512-split.pth",
 )

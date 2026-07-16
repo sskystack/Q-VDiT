@@ -31,7 +31,7 @@ taq:
 calib_data:
   path: "your path of calib data"
   n_steps: 2
-  batch_size: 2
+  batch_size: 4
   n_samples: 1
   keep_cache_on_cpu: true
   pin_memory: true

@@ -43,6 +43,7 @@ class STDiTBlock(nn.Module):
         mlp_ratio=4.0,
         drop_path=0.0,
         enable_flashattn=False,
+        enable_memory_efficient_attention=False,
         enable_layernorm_kernel=False,
         enable_sequence_parallelism=False,
         separate_qkv=True,
@@ -50,6 +51,7 @@ class STDiTBlock(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
         self.enable_flashattn = enable_flashattn
+        self.enable_memory_efficient_attention = enable_memory_efficient_attention
         self._enable_sequence_parallelism = enable_sequence_parallelism
 
         if enable_sequence_parallelism:
@@ -65,6 +67,7 @@ class STDiTBlock(nn.Module):
             num_heads=num_heads,
             qkv_bias=True,
             enable_flashattn=enable_flashattn,
+            enable_memory_efficient_attention=enable_memory_efficient_attention,
             separate_qkv=separate_qkv,
         )
         self.cross_attn = self.mha_cls(hidden_size, num_heads)
@@ -75,6 +78,7 @@ class STDiTBlock(nn.Module):
             num_heads=num_heads,
             qkv_bias=True,
             enable_flashattn=self.enable_flashattn,
+            enable_memory_efficient_attention=self.enable_memory_efficient_attention,
             separate_qkv=separate_qkv,
         )
         
@@ -151,6 +155,7 @@ class STDiT(nn.Module):
         time_scale=1.0,
         freeze=None,
         enable_flashattn=False,
+        enable_memory_efficient_attention=False,
         enable_layernorm_kernel=False,
         enable_sequence_parallelism=False,
         separate_qkv=True,
@@ -172,6 +177,7 @@ class STDiT(nn.Module):
         self.depth = depth
         self.mlp_ratio = mlp_ratio
         self.enable_flashattn = enable_flashattn
+        self.enable_memory_efficient_attention = enable_memory_efficient_attention
         self.enable_layernorm_kernel = enable_layernorm_kernel
         self.separate_qkv = separate_qkv
         self.space_scale = space_scale
@@ -200,6 +206,7 @@ class STDiT(nn.Module):
                     mlp_ratio=self.mlp_ratio,
                     drop_path=drop_path[i],
                     enable_flashattn=self.enable_flashattn,
+                    enable_memory_efficient_attention=self.enable_memory_efficient_attention,
                     enable_layernorm_kernel=self.enable_layernorm_kernel,
                     enable_sequence_parallelism=enable_sequence_parallelism,
                     d_t=self.num_temporal,

@@ -121,6 +121,7 @@ class Attention(nn.Module):
         proj_drop: float = 0.0,
         norm_layer: nn.Module = nn.LayerNorm,
         enable_flashattn: bool = False,
+        enable_memory_efficient_attention: bool = False,
         separate_qkv: bool = True,
     ) -> None:
         super().__init__()
@@ -130,6 +131,7 @@ class Attention(nn.Module):
         self.head_dim = dim // num_heads
         self.scale = self.head_dim**-0.5
         self.enable_flashattn = enable_flashattn
+        self.enable_memory_efficient_attention = enable_memory_efficient_attention
 
         # INFO: the original opensora code, use the self.qkv as a large linear layer with 3x channels
         # it is not compatible with quantization which use the same set of quant param for the whole layer
@@ -159,7 +161,7 @@ class Attention(nn.Module):
         else:
             qkv = self.qkv(x)
         qkv_shape = (B, N, 3, self.num_heads, self.head_dim)
-        if self.enable_flashattn:
+        if self.enable_flashattn or self.enable_memory_efficient_attention:
             qkv_permute_shape = (2, 0, 1, 3, 4)
         else:
             qkv_permute_shape = (2, 0, 3, 1, 4)
@@ -176,6 +178,14 @@ class Attention(nn.Module):
                 dropout_p=self.attn_drop.p if self.training else 0.0,
                 softmax_scale=self.scale,
             )
+        elif self.enable_memory_efficient_attention:
+            x = xformers.ops.memory_efficient_attention(
+                q,
+                k,
+                v,
+                p=self.attn_drop.p if self.training else 0.0,
+                scale=self.scale,
+            )
         else:
             dtype = q.dtype
             q = q * self.scale
@@ -187,7 +197,7 @@ class Attention(nn.Module):
             x = attn @ v
 
         x_output_shape = (B, N, C)
-        if not self.enable_flashattn:
+        if not (self.enable_flashattn or self.enable_memory_efficient_attention):
             x = x.transpose(1, 2)
         x = x.reshape(x_output_shape)
         x = self.proj(x)
@@ -206,6 +216,7 @@ class SeqParallelAttention(Attention):
         proj_drop: float = 0.0,
         norm_layer: nn.Module = nn.LayerNorm,
         enable_flashattn: bool = False,
+        enable_memory_efficient_attention: bool = False,
     ) -> None:
         super().__init__(
             dim=dim,
@@ -216,6 +227,7 @@ class SeqParallelAttention(Attention):
             proj_drop=proj_drop,
             norm_layer=norm_layer,
             enable_flashattn=enable_flashattn,
+            enable_memory_efficient_attention=enable_memory_efficient_attention,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -231,7 +243,7 @@ class SeqParallelAttention(Attention):
         # [B, SUB_N, 3, NUM_HEAD, HEAD_DIM] -> [B, N, 3, NUM_HEAD_PER_DEVICE, HEAD_DIM]
         qkv = all_to_all(qkv, sp_group, scatter_dim=3, gather_dim=1)
 
-        if self.enable_flashattn:
+        if self.enable_flashattn or self.enable_memory_efficient_attention:
             qkv_permute_shape = (2, 0, 1, 3, 4)  # [3, B, N, NUM_HEAD_PER_DEVICE, HEAD_DIM]
         else:
             qkv_permute_shape = (2, 0, 3, 1, 4)  # [3, B, NUM_HEAD_PER_DEVICE, N, HEAD_DIM]
@@ -249,6 +261,14 @@ class SeqParallelAttention(Attention):
                 dropout_p=self.attn_drop.p if self.training else 0.0,
                 softmax_scale=self.scale,
             )
+        elif self.enable_memory_efficient_attention:
+            x = xformers.ops.memory_efficient_attention(
+                q,
+                k,
+                v,
+                p=self.attn_drop.p if self.training else 0.0,
+                scale=self.scale,
+            )
         else:
             dtype = q.dtype
             q = q * self.scale
@@ -259,7 +279,7 @@ class SeqParallelAttention(Attention):
             attn = self.attn_drop(attn)
             x = attn @ v
 
-        if not self.enable_flashattn:
+        if not (self.enable_flashattn or self.enable_memory_efficient_attention):
             x = x.transpose(1, 2)
 
         # apply all to all to gather back attention heads and split sequence
