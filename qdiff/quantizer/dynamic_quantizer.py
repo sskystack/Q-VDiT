@@ -21,23 +21,46 @@ class _FusedDynamicQuantizeSTE(torch.autograd.Function):
         output.clamp_(lower_bound, upper_bound)
         output.sub_(zero_point)
         output.mul_(delta)
-        ctx.save_for_backward(x, delta, zero_point, output)
+        ctx.save_for_backward(x, delta, zero_point)
         ctx.lower_bound = lower_bound
         ctx.upper_bound = upper_bound
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        x, delta, zero_point, output = ctx.saved_tensors
-        scaled = x / delta
-        rounded = scaled.round().add_(zero_point)
-        inside = (rounded >= ctx.lower_bound) & (rounded <= ctx.upper_bound)
-        inside = inside.to(grad_output.dtype)
+        x, delta, zero_point = ctx.saved_tensors
 
-        grad_x = grad_output * inside
-        quantized = output / delta
-        grad_delta_full = grad_output * (quantized - inside * scaled)
-        grad_delta = grad_delta_full.sum_to_size(delta.shape)
+        # Dynamic activation quantization uses [B, token, channel] tensors and
+        # [1, token, 1] scales.  Accumulate the scale gradient by token chunks
+        # so backward never creates another full MLP-sized temporary.
+        if x.ndim == 3 and delta.ndim == 3 and delta.shape[1] == x.shape[1]:
+            grad_x = torch.empty_like(grad_output)
+            grad_delta = torch.zeros_like(delta)
+            chunk_size = 64
+            for start in range(0, x.shape[1], chunk_size):
+                end = min(start + chunk_size, x.shape[1])
+                x_chunk = x[:, start:end]
+                grad_chunk = grad_output[:, start:end]
+                delta_chunk = delta[:, start:end]
+                zero_chunk = zero_point[:, start:end]
+
+                scaled = x_chunk / delta_chunk
+                rounded = scaled.round().add_(zero_chunk)
+                inside = (rounded >= ctx.lower_bound) & (rounded <= ctx.upper_bound)
+                clamped = rounded.clamp_(ctx.lower_bound, ctx.upper_bound).sub_(zero_chunk)
+                inside_float = inside.to(grad_output.dtype)
+                grad_x[:, start:end] = grad_chunk * inside_float
+                delta_term = grad_chunk * (clamped - inside_float * scaled)
+                grad_delta[:, start:end] = delta_term.sum_to_size(delta_chunk.shape)
+        else:
+            scaled = x / delta
+            rounded = scaled.round().add_(zero_point)
+            inside = (rounded >= ctx.lower_bound) & (rounded <= ctx.upper_bound)
+            inside = inside.to(grad_output.dtype)
+            grad_x = grad_output * inside
+            clamped = rounded.clamp_(ctx.lower_bound, ctx.upper_bound).sub_(zero_point)
+            grad_delta_full = grad_output * (clamped - inside * scaled)
+            grad_delta = grad_delta_full.sum_to_size(delta.shape)
         return grad_x, grad_delta, None, None, None
 
 
