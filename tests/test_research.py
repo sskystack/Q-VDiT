@@ -107,6 +107,17 @@ def test_taq_rank_budget_receives_reconstruction_gradients():
     assert module.taq_rank_logit.grad.abs().sum().item() > 0.0
 
 
+def test_eval_rank_allocation_is_discrete():
+    module = TrackAwareResidual(3, 2, config(diffusion="TAQ", groups=4)).eval()
+    gates = torch.tensor([[[[0.4, 0.3, 0.2, 0.1]]]])
+    with torch.no_grad():
+        module.taq_rank_logit.fill_(-8.0)
+        _, budget = module._temperature_and_budget()
+        allocated, active = module._allocate_rank_groups(gates, budget)
+    assert active.sum().item() == 1.0
+    assert torch.count_nonzero(allocated).item() == 1
+
+
 def test_mtd_is_zero_for_identical_features_and_positive_for_motion_error():
     target = torch.randn(2, 4, 3, 8, 8)
     identical = motion_transport_distillation(target, target, config(frame="MTD"))
