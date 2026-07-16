@@ -192,6 +192,9 @@ def merge_args(cfg, args, training=False, mode=None):
         if hasattr(args, "cfg_scale"):
             if args.cfg_scale is not None:
                 cfg.scheduler["cfg_scale"] = args.cfg_scale
+        if hasattr(args, "num_sampling_steps"):
+            if args.num_sampling_steps is not None:
+                cfg.scheduler["num_sampling_steps"] = args.num_sampling_steps
 
     if mode == "quant_inference":
         # append dataset type to args.save_dir

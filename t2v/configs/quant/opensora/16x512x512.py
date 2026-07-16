@@ -25,7 +25,7 @@ text_encoder = dict(
 )
 scheduler = dict(
     type="iddpm",
-    num_sampling_steps=100,
+    num_sampling_steps=50,
     cfg_scale=4.0,
 )
 dtype = "fp32"
