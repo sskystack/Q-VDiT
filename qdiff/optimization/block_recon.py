@@ -382,8 +382,12 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock, calib_data: t
     # transformer blocks as well.  Leaving those two blocks outside gradient
     # checkpointing retains several GiB of their full FP32 graphs and makes a
     # true reconstruction batch of four exceed a 48 GiB device.
-    for transformer_block in block.blocks:
-        set_grad_checkpoint(transformer_block)
+    for block_index, transformer_block in enumerate(block.blocks):
+        # The first block receives frozen embeddings, so it needs the
+        # non-reentrant variant to compute parameter gradients without a
+        # grad-requiring input.  Later blocks receive the first block's
+        # trainable output and can use the lower-memory legacy variant.
+        set_grad_checkpoint(transformer_block, use_reentrant=(block_index != 0))
 
     def load_reconstruction_batch(iteration):
         if isinstance(cached_outs, list):
