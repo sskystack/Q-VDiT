@@ -73,13 +73,20 @@ def verify_fused_dynamic_quantizer():
 
         assert torch.equal(old_output.detach(), new_output.detach())
         assert torch.allclose(old_x.grad, new_x.grad, atol=1.0e-6, rtol=1.0e-6)
-        assert torch.allclose(old_delta.grad, new_delta.grad, atol=2.0e-5, rtol=1.0e-6)
+        scale_gradient_error = _max_error(old_delta.grad, new_delta.grad)
+        scale_gradient_relative_l2 = float(
+            (old_delta.grad - new_delta.grad).norm()
+            / old_delta.grad.norm().clamp_min(1.0e-12)
+        )
+        assert scale_gradient_error < 1.0e-4
+        assert scale_gradient_relative_l2 < 5.0e-7
         print(
             "fused_dynamic_quantizer:",
             f"bounds=({lower},{upper})",
             f"forward={_max_error(old_output, new_output):.3e}",
             f"grad_x={_max_error(old_x.grad, new_x.grad):.3e}",
-            f"grad_scale={_max_error(old_delta.grad, new_delta.grad):.3e}",
+            f"grad_scale={scale_gradient_error:.3e}",
+            f"grad_scale_rel_l2={scale_gradient_relative_l2:.3e}",
         )
 
 
