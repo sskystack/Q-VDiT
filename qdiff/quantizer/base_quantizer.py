@@ -220,8 +220,11 @@ class BaseQuantizer(nn.Module):
             x_min = x.min(dim=-1)[0]
             x_max = x.max(dim=-1)[0]
         else:
-            x_min = torch.amin(x, dim=token_reduction_dims)
-            x_max = torch.amax(x, dim=token_reduction_dims)
+            # Match the flattened [batch * channel] reduction exactly,
+            # including the original first-occurrence gradient rule for tied
+            # extrema, without materializing the permuted contiguous tensor.
+            x_min = x.min(dim=2).values.min(dim=0).values
+            x_max = x.max(dim=2).values.max(dim=0).values
         # Keep the reduction graph intact for checkpoint recomputation.
         # In-place edits of amin/amax outputs invalidate their saved version.
         x_min = x_min.clamp(max=0.0)
