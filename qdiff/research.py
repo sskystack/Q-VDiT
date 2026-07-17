@@ -176,7 +176,10 @@ class TrackAwareResidual(nn.Module):
         if self.training:
             active_mask = torch.sigmoid((rank_budget + 0.5 - positions) / 0.25)
         else:
-            active_count = torch.round(rank_budget.detach()).clamp(1, self.num_groups)
+            budget_tensor = torch.as_tensor(
+                rank_budget, device=soft_gates.device, dtype=soft_gates.dtype
+            )
+            active_count = torch.round(budget_tensor.detach()).clamp(1, self.num_groups)
             active_mask = (positions <= active_count).to(soft_gates.dtype)
         allocated = soft_gates * active_mask
         allocated = allocated / allocated.sum(dim=-1, keepdim=True).clamp_min(1.0e-8)
