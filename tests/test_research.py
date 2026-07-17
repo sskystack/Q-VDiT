@@ -62,6 +62,21 @@ def test_smoke_configs_cover_each_new_module_stage():
         assert data["quant"]["weight"]["optimization"]["iters"] >= 1
 
 
+def test_formal_tarq_stability_config_only_reduces_iterations():
+    root = Path(__file__).parents[1]
+    formal = yaml.safe_load(
+        (root / "t2v/configs/quant/opensora/w4a6_tarq.yaml").read_text()
+    )
+    stability = yaml.safe_load(
+        (root / "tests/configs/w4a6_tarq_formal_stability.yaml").read_text()
+    )
+    formal_iters = formal["quant"]["weight"]["optimization"].pop("iters")
+    stability_iters = stability["quant"]["weight"]["optimization"].pop("iters")
+    assert formal_iters == 10000
+    assert stability_iters == 3
+    assert stability == formal
+
+
 def test_research_config_normalization_is_idempotent():
     normalized = normalize_research_config(config(frame="MTD", diffusion="TAQ"))
     assert normalize_research_config(normalized) == normalized
