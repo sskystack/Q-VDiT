@@ -237,9 +237,10 @@ class QuantLayer(nn.Module):
         out = self.fwd_func(input, weight, bias, **self.fwd_kwargs)  # 在输出的channel上进行channel_wise的量化
         out = self.activation_function(out)
 
-        if torch.isnan(out).any():
-            logging.info('nan exist in the activation')
-            import ipdb; ipdb.set_trace()
+        if not torch.isfinite(out).all():
+            raise FloatingPointError(
+                f"Non-finite activation in {self.__class__.__name__}"
+            )
 
 
         return out

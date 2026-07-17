@@ -121,9 +121,10 @@ class QuantSpatialAttnLinear(QuantLayer):
             out = out + self.tarq(input, BS, T, S, layout="spatial")
         out = self.activation_function(out)
 
-        if torch.isnan(out).any():
-            logging.info('nan exist in the activation')
-            import ipdb; ipdb.set_trace()
+        if not torch.isfinite(out).all():
+            raise FloatingPointError(
+                f"Non-finite activation in {self.__class__.__name__}"
+            )
 
         return out
 
@@ -237,9 +238,10 @@ class QuantTemporalAttnLinear(QuantLayer):
             out = out + self.tarq(input, BS, T, S, layout="temporal")
         out = self.activation_function(out)
 
-        if torch.isnan(out).any():
-            logging.info('nan exist in the activation')
-            import ipdb; ipdb.set_trace()
+        if not torch.isfinite(out).all():
+            raise FloatingPointError(
+                f"Non-finite activation in {self.__class__.__name__}"
+            )
             
         return out
 
@@ -370,8 +372,9 @@ class QuantCrossAttnLinear(QuantLayer):
         out = self.fwd_func(input, weight, bias, **self.fwd_kwargs)
         out = self.activation_function(out)
 
-        if torch.isnan(out).any():
-            logging.info('nan exist in the activation')
-            import ipdb; ipdb.set_trace()
+        if not torch.isfinite(out).all():
+            raise FloatingPointError(
+                f"Non-finite activation in {self.__class__.__name__}"
+            )
 
         return out

@@ -209,10 +209,10 @@ class BaseQuantizer(nn.Module):
                     x = x.reshape([n_channel,-1])
             elif per_group == 'token':
                 assert isinstance(self,ActQuantizer)
-                try:
-                    assert len(x.shape) == 3
-                except:
-                    import ipdb; ipdb.set_trace()
+                if x.ndim != 3:
+                    raise ValueError(
+                        f'Token quantization expects [batch, token, channel], got {tuple(x.shape)}'
+                    )
                 # print(self.module_name, x.shape) # shape: [BS, n_token, C_in]
                 n_token = x.shape[1]
                 # Reducing the original [BS, token, channel] tensor over the
