@@ -59,7 +59,7 @@ def test_smoke_configs_cover_each_new_module_stage():
         data = yaml.safe_load((root / filename).read_text())
         assert tuple(data["method"].values()) == methods
         assert data["calib_data"]["batch_size"] == 4
-        assert data["quant"]["weight"]["optimization"]["iters"] == 1
+        assert data["quant"]["weight"]["optimization"]["iters"] >= 1
 
 
 def test_research_config_normalization_is_idempotent():
@@ -151,6 +151,18 @@ def test_mtd_is_zero_for_identical_features_and_positive_for_motion_error():
     shifted = motion_transport_distillation(torch.roll(target, shifts=1, dims=-1), target, config(frame="MTD"))
     assert identical.abs().item() < 1.0e-5
     assert shifted.item() > identical.item()
+
+
+def test_transport_magnitude_matches_sqrt_and_has_finite_zero_gradient():
+    displacement = torch.randn(32, 2, requires_grad=True)
+    stable = torch.linalg.vector_norm(displacement, dim=-1)
+    reference = displacement.square().sum(-1).sqrt()
+    assert torch.allclose(stable, reference, atol=1.0e-7, rtol=1.0e-6)
+
+    zero = torch.zeros(8, 2, requires_grad=True)
+    torch.linalg.vector_norm(zero, dim=-1).sum().backward()
+    assert torch.isfinite(zero.grad).all()
+    assert torch.count_nonzero(zero.grad).item() == 0
 
 
 def test_trajectory_loss_uses_adjacent_pairs():

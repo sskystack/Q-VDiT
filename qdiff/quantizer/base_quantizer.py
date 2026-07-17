@@ -136,11 +136,15 @@ class BaseQuantizer(nn.Module):
             # does not fit with the q-diffusion optimization (replacing a nn.Parameter)
             # self.delta = self.delta_list[self.bit_idx, 0]
             # self.zero_point = self.zero_point_list[self.bit_idx, 0]
-            if torch.isnan(self.delta).any():
-                import ipdb; ipdb.set_trace()
+            if not torch.isfinite(self.delta).all():
+                raise FloatingPointError(
+                    f'Non-finite quantization delta in layer "{self.module_name}"'
+                )
 
         if torch.all(self.delta == -1):
-            import ipdb; ipdb.set_trace()
+            raise FloatingPointError(
+                f'Uninitialized quantization delta in layer "{self.module_name}"'
+            )
         assert not torch.all(self.delta == -1) # check if not -1
 
         self.n_levels = 2 ** self.n_bits if not self.sym else 2 ** (self.n_bits - 1) - 1
@@ -159,9 +163,15 @@ class BaseQuantizer(nn.Module):
             x_dequant = x_quant * self.delta
         else:
             x_dequant = (x_quant - self.zero_point) * self.delta
-        if torch.isnan(x_dequant).any():
-            # logging.info('nan exist in the activation')
-            import ipdb; ipdb.set_trace()
+        if not torch.isfinite(x_dequant).all():
+            input_nonfinite = int((~torch.isfinite(x)).sum().item())
+            delta_nonfinite = int((~torch.isfinite(self.delta)).sum().item())
+            zero_nonfinite = int((~torch.isfinite(self.zero_point)).sum().item())
+            raise FloatingPointError(
+                f'Non-finite dequantized tensor in layer "{self.module_name}": '
+                f'input_nonfinite={input_nonfinite}, delta_nonfinite={delta_nonfinite}, '
+                f'zero_point_nonfinite={zero_nonfinite}'
+            )
         # import ipdb; ipdb.set_trace()
         return x_dequant
 

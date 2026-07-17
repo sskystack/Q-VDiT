@@ -111,7 +111,10 @@ def _compact_transport_features(video, transport_size, descriptor_dim, temperatu
         [[-1, -1], [-1, 0], [-1, 1], [0, -1], [0, 0], [0, 1], [1, -1], [1, 0], [1, 1]]
     )
     displacement = probs @ offsets
-    magnitude = displacement.square().sum(-1).sqrt()
+    # vector_norm has the same forward value as sqrt(dx^2 + dy^2), but defines
+    # a zero gradient at zero displacement.  The explicit sqrt form produces
+    # inf in backward and turns an upstream zero into NaN (0 * inf).
+    magnitude = torch.linalg.vector_norm(displacement, dim=-1)
     confidence = probs.max(dim=-1).values
     entropy = -(probs.clamp_min(1.0e-8).log() * probs).sum(-1) / math.log(9.0)
     features = torch.stack((magnitude, confidence, entropy), dim=-1)

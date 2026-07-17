@@ -126,6 +126,18 @@ def _select_reconstruction_batch(cached_inps, cached_outs, cached_grads, use_gra
         cur_out = cached_outs[idx]
     cur_grad = cached_grads[idx] if use_grad else None
     return cur_inp, cur_out, cur_grad
+
+
+def _first_nonfinite_trainable(module, use_grad=False):
+    for name, parameter in module.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        value = parameter.grad if use_grad else parameter
+        if value is not None and not torch.isfinite(value).all():
+            return name
+    return None
+
+
 def mv_to_gpu(l_x, device='cuda'):
     if l_x is None:
         pass
@@ -460,12 +472,18 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock, calib_data: t
         # logger.info('loss time {}'.format(t3 - t2))
         # check nan
         
-        if torch.isnan(err):
-            import ipdb; ipdb.set_trace()
+        if not torch.isfinite(err):
+            raise FloatingPointError(f"Non-finite reconstruction loss at iteration {i + 1}")
         if enable_fp32:
             scaler.scale(err).backward()
         else:
             err.backward()  # DEBUG_ONLY: cancel retrain_graph
+        if i < 3:
+            bad_gradient = _first_nonfinite_trainable(block, use_grad=True)
+            if bad_gradient is not None:
+                raise FloatingPointError(
+                    f'Non-finite gradient in "{bad_gradient}" at iteration {i + 1}'
+                )
         # err.backward(retain_graph=True)
         # t4  = time.time()
         # logger.info('backward time {}'.format(t4 - t3))
@@ -479,6 +497,12 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock, calib_data: t
             scaler.update()
         else:
             optimizer.step()
+        if i < 3:
+            bad_parameter = _first_nonfinite_trainable(block, use_grad=False)
+            if bad_parameter is not None:
+                raise FloatingPointError(
+                    f'Non-finite parameter in "{bad_parameter}" after iteration {i + 1}'
+                )
         if scheduler:
             scheduler.step()
 
