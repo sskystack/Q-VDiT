@@ -48,6 +48,20 @@ def test_four_configs_have_the_expected_single_variable_progression():
         assert tuple(data["method"].values()) == methods
 
 
+def test_smoke_configs_cover_each_new_module_stage():
+    root = Path(__file__).parent / "configs"
+    expected = {
+        "w4a6_tarq_smoke.yaml": ("TARQ", "BASELINE", "NONE"),
+        "w4a6_tarq_mtd_smoke.yaml": ("TARQ", "MTD", "NONE"),
+        "w4a6_full_smoke.yaml": ("TARQ", "MTD", "TAQ"),
+    }
+    for filename, methods in expected.items():
+        data = yaml.safe_load((root / filename).read_text())
+        assert tuple(data["method"].values()) == methods
+        assert data["calib_data"]["batch_size"] == 4
+        assert data["quant"]["weight"]["optimization"]["iters"] == 1
+
+
 def test_research_config_normalization_is_idempotent():
     normalized = normalize_research_config(config(frame="MTD", diffusion="TAQ"))
     assert normalize_research_config(normalized) == normalized
