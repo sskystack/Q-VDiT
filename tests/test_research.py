@@ -6,6 +6,7 @@ import yaml
 
 from qdiff.research import (
     TrackAwareResidual,
+    _compact_transport_features,
     motion_transport_distillation,
     normalize_research_config,
     sample_trajectory_pair_indices,
@@ -178,6 +179,16 @@ def test_transport_magnitude_matches_sqrt_and_has_finite_zero_gradient():
     torch.linalg.vector_norm(zero, dim=-1).sum().backward()
     assert torch.isfinite(zero.grad).all()
     assert torch.count_nonzero(zero.grad).item() == 0
+
+
+def test_zero_motion_transport_has_finite_end_to_end_gradient():
+    video = torch.zeros(1, 2, 8, 8, 8, requires_grad=True)
+    features = _compact_transport_features(
+        video, transport_size=8, descriptor_dim=8, temperature=0.07
+    )
+    features.sum().backward()
+    assert torch.isfinite(features).all()
+    assert torch.isfinite(video.grad).all()
 
 
 def test_trajectory_loss_uses_adjacent_pairs():
