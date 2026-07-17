@@ -215,14 +215,22 @@ class TrackAwareResidual(nn.Module):
         else:
             self.last_budget_loss = (active_mask.sum(dim=-1).mean() - self.rank_budget).square()
 
-        correction = torch.zeros(*video.shape[:-1], self.up.shape[1], device=inputs.device, dtype=inputs.dtype)
-        for group in range(self.num_groups):
-            low_rank = F.linear(video, self.down[group].to(inputs.dtype))
-            low_rank = F.linear(low_rank, self.up[group].to(inputs.dtype))
-            correction = correction + gates[..., group : group + 1].to(inputs.dtype) * low_rank
+        correction = grouped_low_rank_residual(
+            video,
+            gates.to(inputs.dtype),
+            self.down.to(inputs.dtype),
+            self.up.to(inputs.dtype),
+        )
         if layout == "spatial":
             return correction.reshape(batch * frames, spatial_tokens, -1)
         return correction.permute(0, 2, 1, 3).reshape(batch * spatial_tokens, frames, -1)
+
+
+def grouped_low_rank_residual(video, gates, down, up):
+    """Apply all TARQ groups without materializing one full output per group."""
+    low_rank = torch.einsum("...c,grc->...gr", video, down)
+    low_rank = low_rank * gates.unsqueeze(-1)
+    return torch.einsum("...gr,gor->...o", low_rank, up)
 
 
 def collect_rank_budget_loss(module):

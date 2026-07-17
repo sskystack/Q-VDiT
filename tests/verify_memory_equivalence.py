@@ -16,6 +16,7 @@ from qdiff.optimization.block_recon import (
     _select_reconstruction_batch,
 )
 from qdiff.quantizer.dynamic_quantizer import _FusedDynamicQuantizeSTE
+from qdiff.research import grouped_low_rank_residual
 
 
 def _max_error(left, right):
@@ -121,6 +122,47 @@ def verify_selective_checkpoint():
     print("selective_checkpoint: exact forward and parameter-gradient match")
 
 
+def verify_grouped_tarq_residual():
+    torch.manual_seed(5)
+    video_source = torch.randn(2, 3, 11, 13)
+    gate_source = torch.softmax(torch.randn(2, 3, 11, 4), dim=-1)
+    down_source = torch.randn(4, 2, 13)
+    up_source = torch.randn(4, 17, 2)
+    probe = torch.randn(2, 3, 11, 17)
+
+    old_tensors = [
+        tensor.clone().requires_grad_()
+        for tensor in (video_source, gate_source, down_source, up_source)
+    ]
+    old_video, old_gates, old_down, old_up = old_tensors
+    old_output = torch.zeros(2, 3, 11, 17)
+    for group in range(4):
+        low_rank = torch.nn.functional.linear(old_video, old_down[group])
+        low_rank = torch.nn.functional.linear(low_rank, old_up[group])
+        old_output = old_output + old_gates[..., group : group + 1] * low_rank
+    (old_output * probe).sum().backward()
+
+    new_tensors = [
+        tensor.clone().requires_grad_()
+        for tensor in (video_source, gate_source, down_source, up_source)
+    ]
+    new_output = grouped_low_rank_residual(*new_tensors)
+    (new_output * probe).sum().backward()
+
+    forward_error = _max_error(old_output, new_output)
+    gradient_errors = [
+        _max_error(old.grad, new.grad)
+        for old, new in zip(old_tensors, new_tensors)
+    ]
+    assert forward_error < 2.0e-5
+    assert max(gradient_errors) < 5.0e-5
+    print(
+        "grouped_tarq_residual:",
+        f"forward={forward_error:.3e}",
+        "gradients=" + ",".join(f"{error:.3e}" for error in gradient_errors),
+    )
+
+
 def verify_async_cache(device):
     cached_inps = [
         torch.arange(8 * 5, dtype=torch.float32).reshape(8, 5),
@@ -206,6 +248,7 @@ def main():
     verify_token_reduction()
     verify_fused_dynamic_quantizer()
     verify_selective_checkpoint()
+    verify_grouped_tarq_residual()
     verify_async_cache(device)
     verify_memory_efficient_attention(device)
     print("all memory-optimization equivalence checks passed")
