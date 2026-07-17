@@ -222,8 +222,10 @@ class BaseQuantizer(nn.Module):
         else:
             x_min = torch.amin(x, dim=token_reduction_dims)
             x_max = torch.amax(x, dim=token_reduction_dims)
-        x_min[x_min>0] = 0.
-        x_max[x_max<0] = 0.
+        # Keep the reduction graph intact for checkpoint recomputation.
+        # In-place edits of amin/amax outputs invalidate their saved version.
+        x_min = x_min.clamp(max=0.0)
+        x_max = x_max.clamp(min=0.0)
 
         if self.momentum:
             if not hasattr(self,'x_min'):
