@@ -1,3 +1,5 @@
+import copy
+import types
 from pathlib import Path
 
 import torch
@@ -7,6 +9,7 @@ import yaml
 from qdiff.research import (
     TrackAwareResidual,
     _compact_transport_features,
+    collect_rank_budget_loss,
     motion_transport_distillation,
     normalize_research_config,
     sample_trajectory_pair_indices,
@@ -111,6 +114,68 @@ def test_single_group_tarq_reduces_to_one_low_rank_residual():
     expected = F.linear(F.linear(inputs.reshape(1, 2, 4, 3), module.down[0]), module.up[0]).reshape(2, 4, 2)
     assert torch.allclose(actual, expected, atol=1.0e-6)
     assert module.last_budget_loss.item() == 0.0
+
+
+def test_tarq_rank_budget_penalizes_multiple_effective_groups_and_backpropagates():
+    module = TrackAwareResidual(3, 2, config(diffusion="NONE", groups=4))
+    with torch.no_grad():
+        module.up.fill_(0.1)
+    output = module(
+        torch.randn(2, 4, 3), batch=1, frames=2, spatial_tokens=4, layout="spatial"
+    )
+    rank_loss = collect_rank_budget_loss(module)
+    assert rank_loss.item() > 0.0
+    rank_loss.backward()
+    assert module.gate.weight.grad is not None
+    assert torch.isfinite(module.gate.weight.grad).all()
+
+
+def test_tarq_rank_budget_keeps_gate_gradients_under_checkpoint_no_grad_forward():
+    module = TrackAwareResidual(3, 2, config(diffusion="NONE", groups=4))
+    with torch.no_grad():
+        module(torch.randn(2, 4, 3), batch=1, frames=2, spatial_tokens=4, layout="spatial")
+    rank_loss = collect_rank_budget_loss(module)
+    assert rank_loss.requires_grad
+    rank_loss.backward()
+    assert module.gate.weight.grad is not None
+    assert torch.isfinite(module.gate.weight.grad).all()
+
+
+def test_effective_group_count_matches_one_hot_and_uniform_allocations():
+    one_hot = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+    uniform = torch.full((1, 4), 0.25)
+    assert TrackAwareResidual.effective_group_count(one_hot).item() == 1.0
+    assert TrackAwareResidual.effective_group_count(uniform).item() == 4.0
+
+
+def test_rank_loss_bookkeeping_preserves_original_tarq_forward_and_reconstruction_gradients():
+    torch.manual_seed(7)
+    updated = TrackAwareResidual(3, 2, config(diffusion="NONE", groups=4))
+    reference = copy.deepcopy(updated)
+
+    def original_allocation(self, motion):
+        temperature, rank_budget = self._temperature_and_budget()
+        soft_gates = F.softmax(self.gate(motion) / temperature, dim=-1)
+        gates, _ = self._allocate_rank_groups(soft_gates, rank_budget)
+        return gates, self.down.new_tensor(0.0)
+
+    reference._allocation_budget_loss = types.MethodType(original_allocation, reference)
+    source = torch.randn(2, 4, 3)
+    probe = torch.randn(2, 4, 2)
+    updated_input = source.clone().requires_grad_()
+    reference_input = source.clone().requires_grad_()
+    updated_output = updated(updated_input, 1, 2, 4, "spatial")
+    reference_output = reference(reference_input, 1, 2, 4, "spatial")
+    (updated_output * probe).sum().backward()
+    (reference_output * probe).sum().backward()
+
+    assert torch.equal(updated_output, reference_output)
+    assert torch.equal(updated_input.grad, reference_input.grad)
+    for updated_parameter, reference_parameter in zip(updated.parameters(), reference.parameters()):
+        if updated_parameter.grad is None or reference_parameter.grad is None:
+            assert updated_parameter.grad is reference_parameter.grad
+        else:
+            assert torch.equal(updated_parameter.grad, reference_parameter.grad)
 
 
 def test_taq_rank_budget_changes_the_number_of_active_groups():

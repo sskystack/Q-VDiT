@@ -194,6 +194,26 @@ class TrackAwareResidual(nn.Module):
         all_bin_budgets = 1.0 + (self.num_groups - 1.0) * torch.sigmoid(self.taq_rank_logit)
         return (all_bin_budgets.mean() - self.rank_budget).square()
 
+    @staticmethod
+    def effective_group_count(gates):
+        """Differentiable number of groups used by a normalized gate vector.
+
+        This is the inverse Simpson concentration: it is exactly one for a
+        one-hot allocation and equals the number of groups for a uniform
+        allocation.  Measuring the post-allocation gates makes the TARQ rank
+        budget constrain the residual that is actually applied.
+        """
+        return gates.square().sum(dim=-1).clamp_min(1.0e-8).reciprocal()
+
+    def _allocation_budget_loss(self, motion):
+        temperature, rank_budget = self._temperature_and_budget()
+        gate_logits = self.gate(motion) / temperature
+        soft_gates = F.softmax(gate_logits, dim=-1)
+        gates, _ = self._allocate_rank_groups(soft_gates, rank_budget)
+        effective_groups = self.effective_group_count(gates).mean()
+        loss = (effective_groups - rank_budget).square() + self.budget_regularization()
+        return gates, loss
+
     def forward(self, inputs, batch, frames, spatial_tokens, layout):
         side = int(math.sqrt(spatial_tokens))
         if side * side != spatial_tokens:
@@ -205,7 +225,7 @@ class TrackAwareResidual(nn.Module):
         else:
             raise ValueError(f"Unknown TARQ layout: {layout}")
         video_grid = video.reshape(batch, frames, side, side, inputs.shape[-1])
-        temperature, rank_budget = self._temperature_and_budget()
+        temperature, _ = self._temperature_and_budget()
         transport_temperature = float(temperature.detach()) if torch.is_tensor(temperature) else float(temperature)
         motion = _compact_transport_features(
             video_grid, self.transport_size, self.descriptor_dim, transport_temperature
@@ -213,13 +233,14 @@ class TrackAwareResidual(nn.Module):
         motion = motion.permute(0, 1, 4, 2, 3).reshape(batch * frames, 3, motion.shape[2], motion.shape[3])
         motion = F.interpolate(motion, size=(side, side), mode="bilinear", align_corners=False)
         motion = motion.reshape(batch, frames, 3, spatial_tokens).permute(0, 1, 3, 2)
-        gate_logits = self.gate(motion) / temperature
-        soft_gates = F.softmax(gate_logits, dim=-1)
-        gates, active_mask = self._allocate_rank_groups(soft_gates, rank_budget)
-        if self.taq_enabled:
-            self.last_budget_loss = self.budget_regularization()
-        else:
-            self.last_budget_loss = (active_mask.sum(dim=-1).mean() - self.rank_budget).square()
+        gates, self.last_budget_loss = self._allocation_budget_loss(motion)
+        if not torch.is_grad_enabled():
+            # Reentrant gradient checkpointing executes the original forward
+            # under no_grad.  Rebuild only the tiny gate/budget graph so the
+            # auxiliary rank loss still trains every TARQ gate without keeping
+            # the full transformer activation graph resident.
+            with torch.enable_grad():
+                _, self.last_budget_loss = self._allocation_budget_loss(motion.detach())
 
         correction = grouped_low_rank_residual(
             video,
@@ -240,7 +261,11 @@ def grouped_low_rank_residual(video, gates, down, up):
 
 
 def collect_rank_budget_loss(module):
-    losses = [child.budget_regularization() for child in module.modules() if isinstance(child, TrackAwareResidual)]
+    losses = [
+        child.last_budget_loss
+        for child in module.modules()
+        if isinstance(child, TrackAwareResidual) and child.last_budget_loss is not None
+    ]
     if not losses:
         parameter = next(module.parameters(), None)
         return torch.tensor(0.0, device=parameter.device if parameter is not None else "cpu")
