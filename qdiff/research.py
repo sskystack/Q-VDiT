@@ -22,6 +22,27 @@ def _plain_dict(value):
 # use TARQ and always keeps the TQE compensation.
 TARQ_SCOPES = ("spatial_attn", "temporal_attn", "cross_attn", "ffn")
 
+# Gate input feature families.  Motivation experiments
+# (tools/verify_motion_hypothesis.py) showed quantization-error structure is
+# organized primarily by token saliency (magnitude / outlier statistics) and
+# only weakly by motion, so the default gate is saliency-primary with motion
+# as an auxiliary signal; each family can be ablated independently.
+GATE_FEATURE_DIMS = {"motion": 5, "content": 2}
+
+
+def _normalize_gate_features(value):
+    if value is None:
+        return ("motion", "content")
+    if isinstance(value, str):
+        value = [value]
+    feats = tuple(str(item).lower() for item in value)
+    unknown = [item for item in feats if item not in GATE_FEATURE_DIMS]
+    if unknown:
+        raise ValueError(f"Unknown tarq.gate_features entries {unknown}; valid: {list(GATE_FEATURE_DIMS)}")
+    if not feats:
+        raise ValueError("tarq.gate_features must not be empty")
+    return feats
+
 
 def _normalize_tarq_scope(value):
     if value is None:
@@ -53,6 +74,7 @@ def normalize_research_config(config=None):
             "num_groups": int(tarq.get("num_groups", 4)),
             "rank_per_group": int(tarq.get("rank_per_group", 1)),
             "apply_to": _normalize_tarq_scope(tarq.get("apply_to")),
+            "gate_features": _normalize_gate_features(tarq.get("gate_features")),
             "transport_size": int(tarq.get("transport_size", 16)),
             "descriptor_dim": int(tarq.get("descriptor_dim", 8)),
             "temperature": float(tarq.get("temperature", 0.07)),
@@ -110,6 +132,28 @@ def sample_trajectory_pair_indices(total_size, n_steps, samples_per_step, iters,
 
 
 MOTION_FEATURE_DIM = 5  # magnitude, confidence, entropy, dx, dy
+CONTENT_FEATURE_DIM = 2  # standardized log-norm, standardized outlier score
+
+
+def _content_saliency(video):
+    """Per-token quantization-saliency features from a [B, T, S, C] grid.
+
+    Log token norm tracks overall magnitude; the outlier score max|x|/rms
+    tracks how peaked the channel distribution is (peaked tokens suffer the
+    largest per-token quantization damage).  Both are standardized over the
+    tokens of each sample so the gate sees scale-free inputs at every layer.
+    """
+    norm = video.norm(dim=-1)
+    rms = video.square().mean(dim=-1).sqrt().clamp_min(1.0e-6)
+    log_norm = norm.clamp_min(1.0e-6).log()
+    outlier = video.abs().amax(dim=-1) / rms
+
+    def standardize(feature):
+        mean = feature.mean(dim=(1, 2), keepdim=True)
+        std = feature.std(dim=(1, 2), keepdim=True).clamp_min(1.0e-6)
+        return (feature - mean) / std
+
+    return torch.stack((standardize(log_norm), standardize(outlier)), dim=-1)
 
 
 def _compact_transport_features(video, transport_size, descriptor_dim, temperature):
@@ -200,7 +244,9 @@ class TrackAwareResidual(nn.Module):
         # an orthogonally-initialized learned projection preserves distances at
         # init and lets calibration pick motion-discriminative directions.
         self.descriptor_proj = nn.Linear(in_features, min(self.descriptor_dim, in_features), bias=False)
-        self.gate = nn.Linear(MOTION_FEATURE_DIM, self.num_groups)
+        self.gate_features = config["tarq"]["gate_features"]
+        gate_in = sum(GATE_FEATURE_DIMS[name] for name in self.gate_features)
+        self.gate = nn.Linear(gate_in, self.num_groups)
         nn.init.kaiming_uniform_(self.down, a=math.sqrt(5))
         nn.init.orthogonal_(self.descriptor_proj.weight)
         nn.init.zeros_(self.gate.weight)
@@ -270,9 +316,9 @@ class TrackAwareResidual(nn.Module):
         """
         return gates.square().sum(dim=-1).clamp_min(1.0e-8).reciprocal()
 
-    def _allocation_budget_loss(self, motion):
+    def _allocation_budget_loss(self, gate_feats):
         temperature, rank_budget = self._temperature_and_budget()
-        gate_logits = self.gate(motion) / temperature
+        gate_logits = self.gate(gate_feats) / temperature
         soft_gates = F.softmax(gate_logits, dim=-1)
         gates, _ = self._allocate_rank_groups(soft_gates, rank_budget)
         effective_groups = self.effective_group_count(gates).mean()
@@ -291,32 +337,40 @@ class TrackAwareResidual(nn.Module):
             video = inputs.reshape(batch, spatial_tokens, frames, inputs.shape[-1]).permute(0, 2, 1, 3)
         else:
             raise ValueError(f"Unknown TARQ layout: {layout}")
-        motion = None
-        if self.motion_context is not None:
-            motion = self.motion_context.get(batch, frames, spatial_tokens)
-        if motion is None:
-            video_grid = video.reshape(batch, frames, side, side, inputs.shape[-1])
-            # The transport softmax keeps the fixed base temperature: TAQ
-            # modulates only gate sparsity, not the motion evidence itself.
-            descriptor_grid = F.linear(video_grid, self.descriptor_proj.weight.to(inputs.dtype))
-            motion = _compact_transport_features(
-                descriptor_grid, self.transport_size, descriptor_grid.shape[-1], self.base_temperature
-            )
-            motion = motion.permute(0, 1, 4, 2, 3).reshape(
-                batch * frames, MOTION_FEATURE_DIM, motion.shape[2], motion.shape[3]
-            )
-            motion = F.interpolate(motion, size=(side, side), mode="bilinear", align_corners=False)
-            motion = motion.reshape(batch, frames, MOTION_FEATURE_DIM, spatial_tokens).permute(0, 1, 3, 2)
+        feature_parts = []
+        if "motion" in self.gate_features:
+            motion = None
             if self.motion_context is not None:
-                self.motion_context.set(motion)
-        gates, self.last_budget_loss = self._allocation_budget_loss(motion)
+                motion = self.motion_context.get(batch, frames, spatial_tokens)
+            if motion is None:
+                video_grid = video.reshape(batch, frames, side, side, inputs.shape[-1])
+                # The transport softmax keeps the fixed base temperature: TAQ
+                # modulates only gate sparsity, not the motion evidence itself.
+                descriptor_grid = F.linear(video_grid, self.descriptor_proj.weight.to(inputs.dtype))
+                motion = _compact_transport_features(
+                    descriptor_grid, self.transport_size, descriptor_grid.shape[-1], self.base_temperature
+                )
+                motion = motion.permute(0, 1, 4, 2, 3).reshape(
+                    batch * frames, MOTION_FEATURE_DIM, motion.shape[2], motion.shape[3]
+                )
+                motion = F.interpolate(motion, size=(side, side), mode="bilinear", align_corners=False)
+                motion = motion.reshape(batch, frames, MOTION_FEATURE_DIM, spatial_tokens).permute(0, 1, 3, 2)
+                if self.motion_context is not None:
+                    self.motion_context.set(motion)
+            feature_parts.append(motion)
+        if "content" in self.gate_features:
+            # Saliency features come from this layer's own input (unlike the
+            # motion descriptor they are layer-specific and nearly free).
+            feature_parts.append(_content_saliency(video))
+        gate_feats = feature_parts[0] if len(feature_parts) == 1 else torch.cat(feature_parts, dim=-1)
+        gates, self.last_budget_loss = self._allocation_budget_loss(gate_feats)
         if not torch.is_grad_enabled():
             # Reentrant gradient checkpointing executes the original forward
             # under no_grad.  Rebuild only the tiny gate/budget graph so the
             # auxiliary rank loss still trains every TARQ gate without keeping
             # the full transformer activation graph resident.
             with torch.enable_grad():
-                _, self.last_budget_loss = self._allocation_budget_loss(motion.detach())
+                _, self.last_budget_loss = self._allocation_budget_loss(gate_feats.detach())
 
         correction = grouped_low_rank_residual(
             video,

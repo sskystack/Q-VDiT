@@ -322,3 +322,39 @@ def test_tarq_apply_to_scope_is_validated_and_defaults_to_attention():
         assert "typo_axis" in str(error)
     else:
         raise AssertionError("invalid tarq scope must raise")
+
+
+def test_gate_features_selection_controls_gate_width_and_transport_usage():
+    from qdiff import research
+
+    hybrid = TrackAwareResidual(6, 5, config(groups=4))
+    assert hybrid.gate.in_features == 7  # 5 motion + 2 content by default
+
+    cfg = config(groups=4)
+    cfg["tarq"]["gate_features"] = ["content"]
+    content_only = TrackAwareResidual(6, 5, cfg)
+    assert content_only.gate.in_features == 2
+
+    calls = []
+    original = research._compact_transport_features
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    research._compact_transport_features = counting
+    try:
+        out = content_only(torch.randn(2, 4, 6), batch=1, frames=2, spatial_tokens=4, layout="spatial")
+        assert len(calls) == 0  # content-only gate never computes transport
+        assert torch.isfinite(out).all()
+        hybrid(torch.randn(2, 4, 6), batch=1, frames=2, spatial_tokens=4, layout="spatial")
+        assert len(calls) == 1
+    finally:
+        research._compact_transport_features = original
+
+    try:
+        normalize_research_config({"tarq": {"gate_features": ["motion", "colour"]}})
+    except ValueError as error:
+        assert "colour" in str(error)
+    else:
+        raise AssertionError("invalid gate feature must raise")

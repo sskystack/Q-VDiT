@@ -12,6 +12,7 @@ method:
 tarq:
   num_groups: 4
   apply_to: ["spatial_attn", "temporal_attn", "cross_attn", "ffn"]
+  gate_features: ["content", "motion"]
   rank_per_group: 1
   transport_size: 16
   descriptor_dim: 8
