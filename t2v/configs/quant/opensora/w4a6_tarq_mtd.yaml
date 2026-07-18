@@ -4,6 +4,7 @@ model:
   model_type: "opensora"
 conditional: true
 cfg_split: true
+noise_channels: 4
 method:
   token_axis: "TARQ"
   frame_axis: "MTD"
@@ -34,6 +35,7 @@ quant:
   weight:
     optimization:
       joint_weight_act_opt: false
+      act_quant_in_recon: false
       use_grad: false
       iters: 10000
       checkpoint_interval: 1000

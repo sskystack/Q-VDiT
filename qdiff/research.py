@@ -26,6 +26,10 @@ def normalize_research_config(config=None):
         "token_axis": str(method.get("token_axis", "TQE")).upper(),
         "frame_axis": str(method.get("frame_axis", "BASELINE")).upper(),
         "diffusion_axis": str(method.get("diffusion_axis", "NONE")).upper(),
+        # STDiT predicts noise and variance stacked on the channel axis; only
+        # the first `noise_channels` channels are the denoising signal that the
+        # research losses should supervise.
+        "noise_channels": int(config.get("noise_channels", 4)),
         "tarq": {
             "num_groups": int(tarq.get("num_groups", 4)),
             "rank_per_group": int(tarq.get("rank_per_group", 1)),
@@ -85,6 +89,9 @@ def sample_trajectory_pair_indices(total_size, n_steps, samples_per_step, iters,
     return torch.stack((base, paired), dim=-1).reshape(iters, batch_size)
 
 
+MOTION_FEATURE_DIM = 5  # magnitude, confidence, entropy, dx, dy
+
+
 def _compact_transport_features(video, transport_size, descriptor_dim, temperature):
     # video: [B, T, H, W, C]
     batch, frames, height, width, channels = video.shape
@@ -96,7 +103,7 @@ def _compact_transport_features(video, transport_size, descriptor_dim, temperatu
     descriptors = F.normalize(descriptors, dim=2, eps=1.0e-6)
 
     if frames == 1:
-        zeros = video.new_zeros(batch, 1, size, size, 3)
+        zeros = video.new_zeros(batch, 1, size, size, MOTION_FEATURE_DIM)
         return zeros
 
     current = descriptors[:, :-1]
@@ -117,8 +124,12 @@ def _compact_transport_features(video, transport_size, descriptor_dim, temperatu
     magnitude = torch.linalg.vector_norm(displacement, dim=-1)
     confidence = probs.max(dim=-1).values
     entropy = -(probs.clamp_min(1.0e-8).log() * probs).sum(-1) / math.log(9.0)
-    features = torch.stack((magnitude, confidence, entropy), dim=-1)
-    features = features.reshape(batch, frames - 1, size, size, 3)
+    # Keep the expected displacement direction alongside its magnitude so the
+    # gate can separate motion *patterns*, not only motion strength.
+    features = torch.stack(
+        (magnitude, confidence, entropy, displacement[..., 0], displacement[..., 1]), dim=-1
+    )
+    features = features.reshape(batch, frames - 1, size, size, MOTION_FEATURE_DIM)
     first = features[:, :1]
     return torch.cat((first, features), dim=1)
 
@@ -138,8 +149,14 @@ class TrackAwareResidual(nn.Module):
         self.num_bins = config["taq"]["num_bins"]
         self.down = nn.Parameter(torch.empty(self.num_groups, self.rank_per_group, in_features))
         self.up = nn.Parameter(torch.zeros(self.num_groups, out_features, self.rank_per_group))
-        self.gate = nn.Linear(3, self.num_groups)
+        # Learned projection for the transport descriptor.  Matching on an
+        # arbitrary slice of the first channels has no semantic selectivity;
+        # an orthogonally-initialized learned projection preserves distances at
+        # init and lets calibration pick motion-discriminative directions.
+        self.descriptor_proj = nn.Linear(in_features, min(self.descriptor_dim, in_features), bias=False)
+        self.gate = nn.Linear(MOTION_FEATURE_DIM, self.num_groups)
         nn.init.kaiming_uniform_(self.down, a=math.sqrt(5))
+        nn.init.orthogonal_(self.descriptor_proj.weight)
         nn.init.zeros_(self.gate.weight)
         nn.init.zeros_(self.gate.bias)
         if self.taq_enabled:
@@ -225,14 +242,17 @@ class TrackAwareResidual(nn.Module):
         else:
             raise ValueError(f"Unknown TARQ layout: {layout}")
         video_grid = video.reshape(batch, frames, side, side, inputs.shape[-1])
-        temperature, _ = self._temperature_and_budget()
-        transport_temperature = float(temperature.detach()) if torch.is_tensor(temperature) else float(temperature)
+        # The transport softmax keeps the fixed base temperature: TAQ modulates
+        # only gate sparsity, not how the motion evidence itself is computed.
+        descriptor_grid = F.linear(video_grid, self.descriptor_proj.weight.to(inputs.dtype))
         motion = _compact_transport_features(
-            video_grid, self.transport_size, self.descriptor_dim, transport_temperature
+            descriptor_grid, self.transport_size, descriptor_grid.shape[-1], self.base_temperature
         )
-        motion = motion.permute(0, 1, 4, 2, 3).reshape(batch * frames, 3, motion.shape[2], motion.shape[3])
+        motion = motion.permute(0, 1, 4, 2, 3).reshape(
+            batch * frames, MOTION_FEATURE_DIM, motion.shape[2], motion.shape[3]
+        )
         motion = F.interpolate(motion, size=(side, side), mode="bilinear", align_corners=False)
-        motion = motion.reshape(batch, frames, 3, spatial_tokens).permute(0, 1, 3, 2)
+        motion = motion.reshape(batch, frames, MOTION_FEATURE_DIM, spatial_tokens).permute(0, 1, 3, 2)
         gates, self.last_budget_loss = self._allocation_budget_loss(motion)
         if not torch.is_grad_enabled():
             # Reentrant gradient checkpointing executes the original forward
@@ -292,6 +312,11 @@ def motion_transport_distillation(pred, target, research_config):
     if config["frame_axis"] != "MTD" or pred.ndim != 5 or pred.shape[2] < 2:
         return pred.new_tensor(0.0)
     mtd = config["mtd"]
+    # Match transport on the denoising-signal channels only; the stacked
+    # variance channels are not features an object "moves" in.
+    noise_channels = config["noise_channels"]
+    pred = pred[:, :noise_channels]
+    target = target[:, :noise_channels]
     size = min(mtd["transport_size"], pred.shape[-2], pred.shape[-1])
     pred_probs, pred_current, pred_neighbours = _local_transport_distribution(pred, size, mtd["temperature"])
     with torch.no_grad():
@@ -319,8 +344,9 @@ def trajectory_consistency_loss(pred, target, research_config):
     config = normalize_research_config(research_config)
     if config["diffusion_axis"] != "TAQ" or pred.shape[0] < 2 or pred.shape[0] % 2:
         return pred.new_tensor(0.0)
-    pred_eps = pred[:, :3] if pred.ndim == 5 else pred
-    target_eps = target[:, :3] if target.ndim == 5 else target
+    noise_channels = config["noise_channels"]
+    pred_eps = pred[:, :noise_channels] if pred.ndim == 5 else pred
+    target_eps = target[:, :noise_channels] if target.ndim == 5 else target
     pred_delta = pred_eps[1::2] - pred_eps[0::2]
     target_delta = target_eps[1::2] - target_eps[0::2]
     return F.mse_loss(pred_delta, target_delta)

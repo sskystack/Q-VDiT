@@ -422,6 +422,18 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock, calib_data: t
         else:
             param.requires_grad = False
 
+    # When a layer carries a TARQ branch its forward skips the TQE output-lora
+    # (and the temporal frame mask), so those parameters have no gradient path.
+    # Freeze them explicitly instead of letting them sit in the optimizer as
+    # permanently zero-gradient entries.
+    for module_ in block.modules():
+        if getattr(module_, 'tarq', None) is not None:
+            module_.loraA_out.weight.requires_grad = False
+            module_.loraB_out.weight.requires_grad = False
+            mask_param = getattr(module_, 'mask', None)
+            if isinstance(mask_param, torch.nn.Parameter):
+                mask_param.requires_grad = False
+
     current_optimizer_parameter_names = optimizer_parameter_names(block, optimizer)
     start_iteration = 0
     if resume_checkpoint:

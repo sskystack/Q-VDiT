@@ -419,7 +419,26 @@ def main():
             logger.info("No quant parmas, skip optimizing weight quant parameters")
         else:
             taq_enabled = str(config.get("method", {}).get("diffusion_axis", "NONE")).upper() == "TAQ"
-            qnn.set_quant_state(True, taq_enabled)
+            # Whether activation quantization is active during weight
+            # reconstruction.  TAQ needs it on (its clip/scale parameters only
+            # receive gradients through the activation path); the other
+            # configurations historically ran weight-only reconstruction.
+            # Keep this explicit so the ablation confound is visible and the
+            # four configs can be unified deliberately via
+            # quant.weight.optimization.act_quant_in_recon.
+            act_quant_in_recon = bool(
+                config.quant.weight.optimization.get("act_quant_in_recon", taq_enabled)
+            )
+            if taq_enabled and not act_quant_in_recon:
+                raise ValueError(
+                    "TAQ requires act_quant_in_recon=true: its activation clip/scale "
+                    "parameters cannot train with activation quantization disabled"
+                )
+            logger.info(
+                "Weight reconstruction runs with act_quant=%s (act_quant_in_recon)",
+                act_quant_in_recon,
+            )
+            qnn.set_quant_state(True, act_quant_in_recon)
             opt_target = 'weight'
             # --- unpack the config ----
             param_types = list(config.quant.weight.optimization.params.keys())

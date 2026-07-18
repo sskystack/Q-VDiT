@@ -88,7 +88,11 @@ class QuantLayer(nn.Module):
         self.trajectory_num_steps = 1
         if self.research_config["diffusion_axis"] == "TAQ":
             num_bins = self.research_config["taq"]["num_bins"]
-            self.taq_clip_logit = nn.Parameter(torch.full((num_bins,), 6.0))
+            # sigmoid(3) = 0.953 -> clip ratio 0.976: near-identity but far
+            # enough from saturation that clipped elements still produce a
+            # usable gradient.  At 6.0 the sigmoid is saturated (grad ~2.5e-3)
+            # and almost nothing is clipped, so the parameter never trains.
+            self.taq_clip_logit = nn.Parameter(torch.full((num_bins,), 3.0))
             self.taq_log_scale = nn.Parameter(torch.zeros(num_bins))
         else:
             self.register_parameter("taq_clip_logit", None)
@@ -130,7 +134,17 @@ class QuantLayer(nn.Module):
         inputs = inputs.clamp(-max_abs * clip_ratio, max_abs * clip_ratio)
         if hasattr(self, "act_quantizer"):
             scale = self.taq_log_scale[bin_id].exp().clamp(taq["scale_min"], taq["scale_max"])
-            self.act_quantizer.runtime_scale_multiplier = scale
+            if isinstance(self.act_quantizer, DynamicActQuantizer):
+                self.act_quantizer.runtime_scale_multiplier = scale
+            elif not getattr(self, "_taq_scale_warned", False):
+                # Static ActQuantizer never reads runtime_scale_multiplier, so
+                # the learned TAQ scale would be silently ignored.
+                logger.warning(
+                    "TAQ scale multiplier has no effect on %s: activation quantizer "
+                    "%s is static; use quant.activation.quantizer.dynamic=true.",
+                    self.__class__.__name__, self.act_quantizer.__class__.__name__,
+                )
+                self._taq_scale_warned = True
         return inputs
 
     def forward(self, input: torch.Tensor, scale: float = 1.0, split: int = 0, smooth_quant_enable: bool = False):
