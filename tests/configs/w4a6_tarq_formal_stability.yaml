@@ -30,6 +30,7 @@ quant:
       joint_weight_act_opt: false
       use_grad: false
       iters: 3
+      checkpoint_interval: 1000
       loss:
         lambda_coeff: 0.5
         warmup: 0.0

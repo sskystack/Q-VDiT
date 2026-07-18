@@ -1,4 +1,7 @@
 import torch
+import os
+import random
+import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 # import linklink as link
 import logging
@@ -11,6 +14,14 @@ from qdiff.quantizer.base_quantizer import StraightThrough
 # from qdiff.quantizer.base_quantizer import AdaRoundQuantizer
 from qdiff.utils import save_grad_data, save_in_out_data, LossFunction
 from qdiff.research import normalize_research_config, sample_trajectory_pair_indices, set_trajectory_position
+from qdiff.reconstruction_checkpoint import (
+    atomic_torch_save,
+    nested_tensors_to_cpu,
+    nested_tensors_to_device,
+    optimizer_parameter_names,
+    restore_trainable_parameter_state,
+    trainable_parameter_state,
+)
 from torch.cuda.amp import GradScaler, autocast
 from opensora.acceleration.checkpoint import set_grad_checkpoint
 
@@ -325,8 +336,13 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock, calib_data: t
     if opt_target == 'weight_and_activation':
         iters = config.quant.weight.optimization.iters
         assert config.quant.weight.optimization.iters == config.quant.activation.optimization.iters
+        optimization_config = config.quant.weight.optimization
     else:
-        iters = getattr(config.quant,opt_target).optimization.iters
+        optimization_config = getattr(config.quant, opt_target).optimization
+        iters = optimization_config.iters
+    checkpoint_interval = int(getattr(optimization_config, 'checkpoint_interval', 0) or 0)
+    checkpoint_dir = getattr(config, 'reconstruction_checkpoint_dir', None)
+    resume_checkpoint = getattr(config, 'resume_reconstruction', None)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=iters, eta_min=0.)
     # scheduler = None
 
@@ -346,6 +362,16 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock, calib_data: t
     loss_func = LossFunction(block, **config_loss)
 
     research_config = normalize_research_config(config)
+    reconstruction_signature = {
+        'token_axis': research_config['token_axis'],
+        'frame_axis': research_config['frame_axis'],
+        'diffusion_axis': research_config['diffusion_axis'],
+        'batch_size': int(config.calib_data.batch_size),
+        'n_steps': int(config.calib_data.n_steps),
+        'n_samples': int(config.calib_data.n_samples),
+        'weight_bits': int(config.quant.weight.quantizer.n_bits),
+        'activation_bits': int(config.quant.activation.quantizer.n_bits),
+    }
     taq_enabled = research_config['diffusion_axis'] == 'TAQ'
     keep_cache_on_cpu = bool(getattr(config.calib_data, 'keep_cache_on_cpu', False))
     async_prefetch = bool(getattr(config.calib_data, 'async_prefetch', True))
@@ -375,6 +401,15 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock, calib_data: t
             )
         else:
             sample_idxs = torch.randint(low=0,high=cached_inps.shape[0],size=(iters,batch_size), device=cached_inps.device)
+
+    if isinstance(cached_outs, list):
+        sampling_plan = {
+            'kind': 'pmp',
+            'pmp_idxs': pmp_idxs,
+            'idxs_list': idxs_list,
+        }
+    else:
+        sampling_plan = {'kind': 'sample_idxs', 'sample_idxs': sample_idxs}
     torch.set_grad_enabled(True)
     # import ipdb; ipdb.set_trace()
     # iters = 16 # debug
@@ -386,6 +421,48 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock, calib_data: t
             param.requires_grad = True
         else:
             param.requires_grad = False
+
+    current_optimizer_parameter_names = optimizer_parameter_names(block, optimizer)
+    start_iteration = 0
+    if resume_checkpoint:
+        resume_state = torch.load(resume_checkpoint, map_location='cpu')
+        if int(resume_state.get('format_version', 0)) != 1:
+            raise ValueError(f"Unsupported reconstruction checkpoint: {resume_checkpoint}")
+        if int(resume_state['total_iterations']) != int(iters):
+            raise ValueError(
+                f"Checkpoint expects {resume_state['total_iterations']} iterations, config requests {iters}"
+            )
+        if resume_state['opt_target'] != opt_target or list(resume_state['param_types']) != list(param_types):
+            raise ValueError("Reconstruction checkpoint optimization target does not match the config")
+        if resume_state['reconstruction_signature'] != reconstruction_signature:
+            raise ValueError("Reconstruction checkpoint method/calibration signature does not match the config")
+        if resume_state['optimizer_parameter_names'] != current_optimizer_parameter_names:
+            raise ValueError("Reconstruction checkpoint optimizer parameter ordering does not match the model")
+        restore_trainable_parameter_state(block, resume_state['trainable_parameters'])
+        optimizer.load_state_dict(resume_state['optimizer'])
+        scheduler.load_state_dict(resume_state['scheduler'])
+        if enable_fp32 and resume_state.get('scaler') is not None:
+            scaler.load_state_dict(resume_state['scaler'])
+        sampling_device = cached_inps[0].device if isinstance(cached_inps, list) else cached_inps.device
+        sampling_plan = nested_tensors_to_device(resume_state['sampling_plan'], sampling_device)
+        if sampling_plan['kind'] == 'pmp':
+            pmp_idxs = sampling_plan['pmp_idxs']
+            idxs_list = sampling_plan['idxs_list']
+        else:
+            sample_idxs = sampling_plan['sample_idxs']
+        start_iteration = int(resume_state['iteration'])
+        if start_iteration < 0 or start_iteration > iters:
+            raise ValueError(f"Invalid resume iteration {start_iteration} for {iters} total iterations")
+        torch.set_rng_state(resume_state['torch_rng_state'])
+        random.setstate(resume_state['python_rng_state'])
+        np.random.set_state(resume_state['numpy_rng_state'])
+        if torch.cuda.is_available() and resume_state.get('cuda_rng_state') is not None:
+            torch.cuda.set_rng_state(resume_state['cuda_rng_state'], device=device)
+        loss_func.count = start_iteration
+        logger.info(
+            "Resuming reconstruction from iteration %d/%d using %s",
+            start_iteration, iters, resume_checkpoint,
+        )
 
     # for name, param in block.named_parameters():
         # print(f"Parameter {name} requires_grad: {param.requires_grad}")
@@ -419,12 +496,12 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock, calib_data: t
         return (*selected, trajectory_step)
 
     prefetcher = None
-    if keep_cache_on_cpu and async_prefetch and torch.device(device).type == 'cuda':
+    if start_iteration < iters and keep_cache_on_cpu and async_prefetch and torch.device(device).type == 'cuda':
         logger.info("Using pinned FP32 CPU cache with one-batch-ahead CUDA prefetch")
         prefetcher = _AsyncCudaBatchPrefetcher(load_reconstruction_batch, device, pin_memory=pin_memory)
-        prefetcher.start(0)
+        prefetcher.start(start_iteration)
 
-    for i in range(iters):
+    for i in range(start_iteration, iters):
         # print(i)
         # import time
         # t0 = time.time()
@@ -505,6 +582,42 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock, calib_data: t
                 )
         if scheduler:
             scheduler.step()
+
+        completed_iterations = i + 1
+        should_checkpoint = (
+            checkpoint_dir
+            and checkpoint_interval > 0
+            and (completed_iterations % checkpoint_interval == 0 or completed_iterations == iters)
+        )
+        if should_checkpoint:
+            training_state = {
+                'format_version': 1,
+                'iteration': completed_iterations,
+                'total_iterations': int(iters),
+                'opt_target': opt_target,
+                'param_types': list(param_types),
+                'reconstruction_signature': reconstruction_signature,
+                'optimizer_parameter_names': current_optimizer_parameter_names,
+                'trainable_parameters': trainable_parameter_state(block),
+                'optimizer': nested_tensors_to_cpu(optimizer.state_dict()),
+                'scheduler': scheduler.state_dict() if scheduler is not None else None,
+                'scaler': scaler.state_dict() if enable_fp32 else None,
+                'sampling_plan': nested_tensors_to_cpu(sampling_plan),
+                'torch_rng_state': torch.get_rng_state(),
+                'python_rng_state': random.getstate(),
+                'numpy_rng_state': np.random.get_state(),
+                'cuda_rng_state': torch.cuda.get_rng_state(device) if torch.cuda.is_available() else None,
+            }
+            resume_path = os.path.join(checkpoint_dir, 'reconstruction_state_latest.pth')
+            inference_path = os.path.join(
+                checkpoint_dir, f'ckpt_iter_{completed_iterations:08d}.pth'
+            )
+            atomic_torch_save(training_state, resume_path)
+            atomic_torch_save(model.get_inference_quant_params_dict(), inference_path)
+            logger.info(
+                "Saved reconstruction state and inference checkpoint at iteration %d: %s, %s",
+                completed_iterations, resume_path, inference_path,
+            )
 
     if prefetcher is not None:
         prefetcher.close()

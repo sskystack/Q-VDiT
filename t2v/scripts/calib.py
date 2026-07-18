@@ -47,17 +47,25 @@ def main():
     shutil.copytree('./qdiff', os.path.join(outpath,'qdiff'))
 
     log_path = os.path.join(outpath, "run.log")
+    resume_reconstruction = cfg.get('resume_reconstruction', None)
     logging.basicConfig(
         format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
         datefmt='%m/%d/%Y %H:%M:%S',
         level=logging.INFO,
         handlers=[
-            logging.FileHandler(log_path, mode='w'),
+            logging.FileHandler(log_path, mode='a' if resume_reconstruction else 'w'),
             logging.StreamHandler()
         ]
     )
     logger = logging.getLogger(__name__)
     config = OmegaConf.load(f"{opt.calib_config}")
+    config.reconstruction_checkpoint_dir = outpath
+    config.resume_reconstruction = resume_reconstruction
+    checkpoint_interval_override = cfg.get('reconstruction_checkpoint_interval', None)
+    if checkpoint_interval_override is not None:
+        if checkpoint_interval_override < 0:
+            raise ValueError("reconstruction_checkpoint_interval must be non-negative")
+        config.quant.weight.optimization.checkpoint_interval = checkpoint_interval_override
     logger.info("Conducting Command: %s", " ".join(sys.argv))
 
     # ======================================================

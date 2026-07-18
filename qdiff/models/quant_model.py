@@ -9,6 +9,7 @@ from qdiff.models.dit_quant_layer import QuantAttnLinearImg, QuantCrossAttnLinea
 from qdiff.models.quant_block import BaseQuantBlock, TransformerBlock, QuantTransformerBlock, get_specials
 from qdiff.quantizer.base_quantizer import StraightThrough, BaseQuantizer, WeightQuantizer, ActQuantizer
 from qdiff.research import normalize_research_config
+from qdiff.reconstruction_checkpoint import inference_quant_params_state
 
 logger = logging.getLogger(__name__)
 
@@ -270,6 +271,17 @@ class QuantModel(nn.Module):
                 if ".tarq." in name or "taq_" in name
             }
         return self.quant_params_dict
+
+    def get_inference_quant_params_dict(self, dtype=torch.float32):
+        """Return a CPU checkpoint loadable by the quantized inference path.
+
+        Reconstruction temporarily turns optimized quantizer buffers into
+        parameters.  The normal intermediate dictionary therefore cannot be
+        consumed by ``load_quant_params``.  This method serializes those live
+        parameters back into the buffer slot without mutating the running
+        optimizer/model.
+        """
+        return inference_quant_params_state(self.get_quant_params_dict(dtype=dtype), dtype=dtype)
 
 
     def set_quant_params_dict(self, quant_params_dict, module=None, load_buffer_only=True, dtype=torch.float32):

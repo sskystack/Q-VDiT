@@ -45,6 +45,18 @@ def parse_args(training=False, mode=None):
         parser.add_argument("--save_inp_oup", action="store_true")
     elif mode == 'ptq':
         parser.add_argument("--calib_data", default=None, type=str, help="path to quantization calib data")
+        parser.add_argument(
+            "--resume_reconstruction",
+            default=None,
+            type=str,
+            help="path to reconstruction_state_latest.pth for exact optimizer resume",
+        )
+        parser.add_argument(
+            "--reconstruction_checkpoint_interval",
+            default=None,
+            type=int,
+            help="override the reconstruction checkpoint interval from the quant config",
+        )
     elif mode == "quant_inference":
         parser.add_argument("--dataset_type", default="opensora", type=str)
         parser.add_argument(
