@@ -8,7 +8,7 @@ from qdiff.models.stdit_quant_layer import QuantSpatialAttnLinear, QuantTemporal
 from qdiff.models.dit_quant_layer import QuantAttnLinearImg, QuantCrossAttnLinearImg
 from qdiff.models.quant_block import BaseQuantBlock, TransformerBlock, QuantTransformerBlock, get_specials
 from qdiff.quantizer.base_quantizer import StraightThrough, BaseQuantizer, WeightQuantizer, ActQuantizer
-from qdiff.research import normalize_research_config
+from qdiff.research import normalize_research_config, BlockMotionContext, TrackAwareResidual
 from qdiff.reconstruction_checkpoint import inference_quant_params_state
 
 logger = logging.getLogger(__name__)
@@ -58,10 +58,56 @@ class QuantModel(nn.Module):
         # self.specials = get_specials()  # some nn.Modules require special process
         logger.info(f"\n --------------- refactoring quant layers --------------- \n")
         self.quant_layer_refactor(self.model, weight_quant_params, act_quant_params)
+        self.setup_tarq_scope_and_motion_contexts()
         # logger.info(f"\n --------------- refactoring quant blocks --------------- \n")
         # self.quant_block_refactor(self.model, weight_quant_params, act_quant_params)
         # self.set_module_name_for_quantizer(module=self.model)  # add the module name as attribute for each quantizer
         self.quant_params_dict = {}  # init the quant_params_dict as empty
+
+
+    def setup_tarq_scope_and_motion_contexts(self):
+        """Attach TARQ branches beyond the attention layers and wire the
+        per-block shared motion cache.
+
+        The spatial/temporal attention layers create their own TARQ branch in
+        their constructors.  The other video-token linears (ffn fc1/fc2 and the
+        cross-attention q_linear/proj) are attached here by name, driven by
+        research_config["tarq"]["apply_to"].  Every TARQ branch inside one
+        STDiT block then shares a single BlockMotionContext so the motion
+        descriptor is computed once per block forward; a forward pre-hook on
+        the block invalidates the cache (it also fires on gradient-checkpoint
+        recomputation, keeping the cached graph consistent).
+        """
+        if self.research_config["token_axis"] != "TARQ":
+            return
+        scope = self.research_config["tarq"]["apply_to"]
+        blocks = getattr(self.model, "blocks", None)
+        if blocks is None:
+            return
+        attached = 0
+        for block in blocks:
+            targets = []
+            if "ffn" in scope and hasattr(block, "mlp"):
+                targets += [block.mlp.fc1, block.mlp.fc2]
+            if "cross_attn" in scope and hasattr(block, "cross_attn"):
+                targets += [block.cross_attn.q_linear, block.cross_attn.proj]
+            for layer in targets:
+                if isinstance(layer, QuantLayer) and layer.tarq is None:
+                    layer.tarq = TrackAwareResidual(
+                        layer.in_features, layer.weight.shape[0], self.research_config
+                    )
+                    attached += 1
+            tarq_modules = [m for m in block.modules() if isinstance(m, TrackAwareResidual)]
+            if not tarq_modules:
+                continue
+            context = BlockMotionContext()
+            for m in tarq_modules:
+                m.motion_context = context
+            block.register_forward_pre_hook(context.clear)
+        logger.info(
+            f"TARQ scope {list(scope)}: attached {attached} extra branches; "
+            "per-block shared motion contexts wired"
+        )
 
 
     def quant_layer_refactor(self, module: nn.Module, weight_quant_params: dict = {}, act_quant_params: dict = {}, prefix=""):

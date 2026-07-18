@@ -262,3 +262,63 @@ def test_trajectory_loss_uses_adjacent_pairs():
     prediction = target.clone()
     prediction[1, :3] += 1.0
     assert trajectory_consistency_loss(prediction, target, config(diffusion="TAQ")).item() > 0.0
+
+
+def test_sequence_layout_matches_spatial_layout_correction():
+    torch.manual_seed(3)
+    module = TrackAwareResidual(6, 5, config(groups=4))
+    with torch.no_grad():
+        module.up.normal_(0.0, 0.1)
+        module.gate.weight.normal_(0.0, 0.1)
+    x = torch.randn(1, 2 * 4, 6)  # B=1, T=2, S=4 as one frame-major sequence
+    seq = module(x, batch=1, frames=2, spatial_tokens=4, layout="sequence")
+    spa = module(x.reshape(2, 4, 6), batch=1, frames=2, spatial_tokens=4, layout="spatial")
+    assert seq.shape == (1, 8, 5)
+    assert torch.allclose(seq.reshape(2, 4, 5), spa, atol=1.0e-6)
+
+
+def test_block_motion_context_computes_transport_once_and_is_shape_guarded():
+    from qdiff import research
+
+    producer = TrackAwareResidual(6, 5, config(groups=4))
+    consumer = TrackAwareResidual(3, 2, config(groups=4))
+    context = research.BlockMotionContext()
+    producer.motion_context = context
+    consumer.motion_context = context
+
+    calls = []
+    original = research._compact_transport_features
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    research._compact_transport_features = counting
+    try:
+        producer(torch.randn(2, 4, 6), batch=1, frames=2, spatial_tokens=4, layout="spatial")
+        consumer(torch.randn(4, 2, 3), batch=1, frames=2, spatial_tokens=4, layout="temporal")
+        assert len(calls) == 1  # consumer reused the cached motion features
+        context.clear()
+        consumer(torch.randn(4, 2, 3), batch=1, frames=2, spatial_tokens=4, layout="temporal")
+        assert len(calls) == 2  # cleared cache forces recomputation
+        # a mismatched grid must never reuse the cache
+        producer(torch.randn(2, 16, 6), batch=1, frames=2, spatial_tokens=16, layout="spatial")
+        assert len(calls) == 3
+    finally:
+        research._compact_transport_features = original
+
+
+def test_tarq_apply_to_scope_is_validated_and_defaults_to_attention():
+    normalized = normalize_research_config({"method": {"token_axis": "TARQ"}})
+    assert normalized["tarq"]["apply_to"] == ("spatial_attn", "temporal_attn")
+    full = normalize_research_config(
+        {"method": {"token_axis": "TARQ"},
+         "tarq": {"apply_to": ["spatial_attn", "temporal_attn", "cross_attn", "ffn"]}}
+    )
+    assert set(full["tarq"]["apply_to"]) == {"spatial_attn", "temporal_attn", "cross_attn", "ffn"}
+    try:
+        normalize_research_config({"tarq": {"apply_to": ["ffn", "typo_axis"]}})
+    except ValueError as error:
+        assert "typo_axis" in str(error)
+    else:
+        raise AssertionError("invalid tarq scope must raise")

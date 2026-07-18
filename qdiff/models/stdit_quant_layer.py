@@ -16,8 +16,7 @@ class QuantSpatialAttnLinear(QuantLayer):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.tarq = None
-        if self.research_config["token_axis"] == "TARQ":
+        if self.research_config["token_axis"] == "TARQ" and "spatial_attn" in self.research_config["tarq"]["apply_to"]:
             self.tarq = TrackAwareResidual(self.in_features, self.weight.shape[0], self.research_config)
         '''weight_quant_params_res = copy.deepcopy(self.weight_quant_params)
         weight_quant_params_res.n_bits = 1
@@ -134,8 +133,7 @@ class QuantTemporalAttnLinear(QuantLayer):
         super().__init__(*args, **kwargs)
         T = self.act_quant_params['n_temporal_token']
         self.mask = nn.Parameter(torch.ones([1, T, 1]))
-        self.tarq = None
-        if self.research_config["token_axis"] == "TARQ":
+        if self.research_config["token_axis"] == "TARQ" and "temporal_attn" in self.research_config["tarq"]["apply_to"]:
             self.tarq = TrackAwareResidual(self.in_features, self.weight.shape[0], self.research_config)
 
     def forward(self, input: torch.Tensor, scale: float = 1.0, split: int = 0):
@@ -357,7 +355,8 @@ class QuantCrossAttnLinear(QuantLayer):
                     weight = self.weight_quantizer(self.weight * channel_wise_scale + lora_weight)
                 else:
                     weight = self.weight_quantizer(self.weight + lora_weight)
-                weight = weight + lora_weight_out
+                if self.tarq is None:
+                    weight = weight + lora_weight_out
             bias = self.bias
         else:
             if self.smooth_quant:
@@ -370,6 +369,11 @@ class QuantCrossAttnLinear(QuantLayer):
             weight = weight.to(torch.float16)
 
         out = self.fwd_func(input, weight, bias, **self.fwd_kwargs)
+        if self.weight_quant and self.tarq is not None:
+            # TARQ is only attached to the video-token linears (q_linear and
+            # the output proj); the text-token kv_linear keeps TQE.
+            assert layer_type == "q", "TARQ cross-attn branch requires video-token input"
+            out = out + self.tarq(input, input.shape[0], T, S, layout="sequence")
         out = self.activation_function(out)
 
         if not torch.isfinite(out).all():

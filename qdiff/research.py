@@ -16,6 +16,25 @@ def _plain_dict(value):
     return dict(value)
 
 
+# Layer families whose inputs are video-token sequences and can therefore
+# carry a TARQ branch.  "cross_attn" covers the video-token side of cross
+# attention (q_linear and the output proj); the text-token kv_linear can never
+# use TARQ and always keeps the TQE compensation.
+TARQ_SCOPES = ("spatial_attn", "temporal_attn", "cross_attn", "ffn")
+
+
+def _normalize_tarq_scope(value):
+    if value is None:
+        return ("spatial_attn", "temporal_attn")
+    if isinstance(value, str):
+        value = [value]
+    scope = tuple(str(item).lower() for item in value)
+    unknown = [item for item in scope if item not in TARQ_SCOPES]
+    if unknown:
+        raise ValueError(f"Unknown tarq.apply_to entries {unknown}; valid: {list(TARQ_SCOPES)}")
+    return scope
+
+
 def normalize_research_config(config=None):
     config = _plain_dict(config)
     method = config if "token_axis" in config else _plain_dict(config.get("method"))
@@ -33,6 +52,7 @@ def normalize_research_config(config=None):
         "tarq": {
             "num_groups": int(tarq.get("num_groups", 4)),
             "rank_per_group": int(tarq.get("rank_per_group", 1)),
+            "apply_to": _normalize_tarq_scope(tarq.get("apply_to")),
             "transport_size": int(tarq.get("transport_size", 16)),
             "descriptor_dim": int(tarq.get("descriptor_dim", 8)),
             "temperature": float(tarq.get("temperature", 0.07)),
@@ -134,6 +154,32 @@ def _compact_transport_features(video, transport_size, descriptor_dim, temperatu
     return torch.cat((first, features), dim=1)
 
 
+class BlockMotionContext:
+    """Per-transformer-block cache for TARQ motion features.
+
+    All TARQ branches inside one block describe the same token grid, so the
+    first branch that runs in a forward pass computes the motion descriptor
+    and the others reuse it.  A forward pre-hook on the owning block clears
+    the cache, which also keeps gradient-checkpoint recomputation correct
+    (the hook fires again on the recompute pass).
+    """
+
+    def __init__(self):
+        self._features = None
+
+    def clear(self, *_args, **_kwargs):
+        self._features = None
+
+    def get(self, batch, frames, spatial_tokens):
+        cached = self._features
+        if cached is None or cached.shape[:3] != (batch, frames, spatial_tokens):
+            return None
+        return cached
+
+    def set(self, features):
+        self._features = features
+
+
 class TrackAwareResidual(nn.Module):
     def __init__(self, in_features, out_features, research_config):
         super().__init__()
@@ -170,6 +216,8 @@ class TrackAwareResidual(nn.Module):
         self.trajectory_step_index = 0
         self.trajectory_num_steps = 1
         self.last_budget_loss = None
+        # Optional per-block shared motion cache (plain attribute, no params).
+        self.motion_context = None
 
     def set_trajectory_position(self, step_index, num_steps):
         self.trajectory_step_index = int(step_index)
@@ -235,24 +283,32 @@ class TrackAwareResidual(nn.Module):
         side = int(math.sqrt(spatial_tokens))
         if side * side != spatial_tokens:
             raise ValueError(f"TARQ requires a square spatial token grid, got {spatial_tokens}")
-        if layout == "spatial":
+        if layout in ("spatial", "sequence"):
+            # [B*T, S, C] and [B, T*S, C] share the same frame-major memory
+            # order, so both reshape directly into [B, T, S, C].
             video = inputs.reshape(batch, frames, spatial_tokens, inputs.shape[-1])
         elif layout == "temporal":
             video = inputs.reshape(batch, spatial_tokens, frames, inputs.shape[-1]).permute(0, 2, 1, 3)
         else:
             raise ValueError(f"Unknown TARQ layout: {layout}")
-        video_grid = video.reshape(batch, frames, side, side, inputs.shape[-1])
-        # The transport softmax keeps the fixed base temperature: TAQ modulates
-        # only gate sparsity, not how the motion evidence itself is computed.
-        descriptor_grid = F.linear(video_grid, self.descriptor_proj.weight.to(inputs.dtype))
-        motion = _compact_transport_features(
-            descriptor_grid, self.transport_size, descriptor_grid.shape[-1], self.base_temperature
-        )
-        motion = motion.permute(0, 1, 4, 2, 3).reshape(
-            batch * frames, MOTION_FEATURE_DIM, motion.shape[2], motion.shape[3]
-        )
-        motion = F.interpolate(motion, size=(side, side), mode="bilinear", align_corners=False)
-        motion = motion.reshape(batch, frames, MOTION_FEATURE_DIM, spatial_tokens).permute(0, 1, 3, 2)
+        motion = None
+        if self.motion_context is not None:
+            motion = self.motion_context.get(batch, frames, spatial_tokens)
+        if motion is None:
+            video_grid = video.reshape(batch, frames, side, side, inputs.shape[-1])
+            # The transport softmax keeps the fixed base temperature: TAQ
+            # modulates only gate sparsity, not the motion evidence itself.
+            descriptor_grid = F.linear(video_grid, self.descriptor_proj.weight.to(inputs.dtype))
+            motion = _compact_transport_features(
+                descriptor_grid, self.transport_size, descriptor_grid.shape[-1], self.base_temperature
+            )
+            motion = motion.permute(0, 1, 4, 2, 3).reshape(
+                batch * frames, MOTION_FEATURE_DIM, motion.shape[2], motion.shape[3]
+            )
+            motion = F.interpolate(motion, size=(side, side), mode="bilinear", align_corners=False)
+            motion = motion.reshape(batch, frames, MOTION_FEATURE_DIM, spatial_tokens).permute(0, 1, 3, 2)
+            if self.motion_context is not None:
+                self.motion_context.set(motion)
         gates, self.last_budget_loss = self._allocation_budget_loss(motion)
         if not torch.is_grad_enabled():
             # Reentrant gradient checkpointing executes the original forward
@@ -270,6 +326,8 @@ class TrackAwareResidual(nn.Module):
         )
         if layout == "spatial":
             return correction.reshape(batch * frames, spatial_tokens, -1)
+        if layout == "sequence":
+            return correction.reshape(batch, frames * spatial_tokens, -1)
         return correction.permute(0, 2, 1, 3).reshape(batch * spatial_tokens, frames, -1)
 
 

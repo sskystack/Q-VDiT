@@ -86,6 +86,10 @@ class QuantLayer(nn.Module):
         self.ignore_reconstruction = False
         self.trajectory_step_index = 0
         self.trajectory_num_steps = 1
+        # TARQ branch: created in the subclass constructors (spatial/temporal
+        # attn) or attached by QuantModel for ffn / cross-attn video-token
+        # linears, according to research_config["tarq"]["apply_to"].
+        self.tarq = None
         if self.research_config["diffusion_axis"] == "TAQ":
             num_bins = self.research_config["taq"]["num_bins"]
             # sigmoid(3) = 0.953 -> clip ratio 0.976: near-identity but far
@@ -234,7 +238,8 @@ class QuantLayer(nn.Module):
                     weight = self.weight_quantizer(self.weight * channel_wise_scale + lora_weight)
                 else:
                     weight = self.weight_quantizer(self.weight + lora_weight)
-                weight = weight + lora_weight_out
+                if self.tarq is None:
+                    weight = weight + lora_weight_out
             bias = self.bias
         else:
             if self.smooth_quant:
@@ -249,6 +254,13 @@ class QuantLayer(nn.Module):
 
 
         out = self.fwd_func(input, weight, bias, **self.fwd_kwargs)  # 在输出的channel上进行channel_wise的量化
+        if self.weight_quant and self.tarq is not None and self.split == 0:
+            # ffn linears see the full frame-major token sequence [B, T*S, C]
+            T = self.act_quant_params['n_temporal_token']
+            S = self.act_quant_params['n_spatial_token']
+            assert input.ndim == 3 and input.shape[1] == T * S, \
+                f"TARQ sequence layout expects [B, T*S, C], got {tuple(input.shape)}"
+            out = out + self.tarq(input, input.shape[0], T, S, layout="sequence")
         out = self.activation_function(out)
 
         if not torch.isfinite(out).all():
