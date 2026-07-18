@@ -275,39 +275,6 @@ def test_sequence_layout_matches_spatial_layout_correction():
     spa = module(x.reshape(2, 4, 6), batch=1, frames=2, spatial_tokens=4, layout="spatial")
     assert seq.shape == (1, 8, 5)
     assert torch.allclose(seq.reshape(2, 4, 5), spa, atol=1.0e-6)
-
-
-def test_block_motion_context_computes_transport_once_and_is_shape_guarded():
-    from qdiff import research
-
-    producer = TrackAwareResidual(6, 5, config(groups=4))
-    consumer = TrackAwareResidual(3, 2, config(groups=4))
-    context = research.BlockMotionContext()
-    producer.motion_context = context
-    consumer.motion_context = context
-
-    calls = []
-    original = research._compact_transport_features
-
-    def counting(*args, **kwargs):
-        calls.append(1)
-        return original(*args, **kwargs)
-
-    research._compact_transport_features = counting
-    try:
-        producer(torch.randn(2, 4, 6), batch=1, frames=2, spatial_tokens=4, layout="spatial")
-        consumer(torch.randn(4, 2, 3), batch=1, frames=2, spatial_tokens=4, layout="temporal")
-        assert len(calls) == 1  # consumer reused the cached motion features
-        context.clear()
-        consumer(torch.randn(4, 2, 3), batch=1, frames=2, spatial_tokens=4, layout="temporal")
-        assert len(calls) == 2  # cleared cache forces recomputation
-        # a mismatched grid must never reuse the cache
-        producer(torch.randn(2, 16, 6), batch=1, frames=2, spatial_tokens=16, layout="spatial")
-        assert len(calls) == 3
-    finally:
-        research._compact_transport_features = original
-
-
 def test_tarq_apply_to_scope_is_validated_and_defaults_to_attention():
     normalized = normalize_research_config({"method": {"token_axis": "TARQ"}})
     assert normalized["tarq"]["apply_to"] == ("spatial_attn", "temporal_attn")
@@ -323,17 +290,11 @@ def test_tarq_apply_to_scope_is_validated_and_defaults_to_attention():
     else:
         raise AssertionError("invalid tarq scope must raise")
 
-
-def test_gate_features_selection_controls_gate_width_and_transport_usage():
+def test_saliency_gate_reads_only_layer_input_and_never_computes_transport():
     from qdiff import research
 
-    hybrid = TrackAwareResidual(6, 5, config(groups=4))
-    assert hybrid.gate.in_features == 7  # 5 motion + 2 content by default
-
-    cfg = config(groups=4)
-    cfg["tarq"]["gate_features"] = ["content"]
-    content_only = TrackAwareResidual(6, 5, cfg)
-    assert content_only.gate.in_features == 2
+    module = TrackAwareResidual(6, 5, config(groups=4))
+    assert module.gate.in_features == 2  # log-norm + outlier score only
 
     calls = []
     original = research._compact_transport_features
@@ -344,17 +305,15 @@ def test_gate_features_selection_controls_gate_width_and_transport_usage():
 
     research._compact_transport_features = counting
     try:
-        out = content_only(torch.randn(2, 4, 6), batch=1, frames=2, spatial_tokens=4, layout="spatial")
-        assert len(calls) == 0  # content-only gate never computes transport
-        assert torch.isfinite(out).all()
-        hybrid(torch.randn(2, 4, 6), batch=1, frames=2, spatial_tokens=4, layout="spatial")
-        assert len(calls) == 1
+        out = module(torch.randn(2, 4, 6), batch=1, frames=2, spatial_tokens=4, layout="spatial")
+        seq = module(torch.randn(1, 8, 6), batch=1, frames=2, spatial_tokens=4, layout="sequence")
     finally:
         research._compact_transport_features = original
+    assert len(calls) == 0
+    assert torch.isfinite(out).all() and torch.isfinite(seq).all()
 
-    try:
-        normalize_research_config({"tarq": {"gate_features": ["motion", "colour"]}})
-    except ValueError as error:
-        assert "colour" in str(error)
-    else:
-        raise AssertionError("invalid gate feature must raise")
+
+def test_saliency_gate_supports_non_square_token_grids():
+    module = TrackAwareResidual(6, 5, config(groups=4))
+    out = module(torch.randn(2, 6, 6), batch=1, frames=2, spatial_tokens=6, layout="spatial")
+    assert out.shape == (2, 6, 5) and torch.isfinite(out).all()

@@ -22,27 +22,6 @@ def _plain_dict(value):
 # use TARQ and always keeps the TQE compensation.
 TARQ_SCOPES = ("spatial_attn", "temporal_attn", "cross_attn", "ffn")
 
-# Gate input feature families.  Motivation experiments
-# (tools/verify_motion_hypothesis.py) showed quantization-error structure is
-# organized primarily by token saliency (magnitude / outlier statistics) and
-# only weakly by motion, so the default gate is saliency-primary with motion
-# as an auxiliary signal; each family can be ablated independently.
-GATE_FEATURE_DIMS = {"motion": 5, "content": 2}
-
-
-def _normalize_gate_features(value):
-    if value is None:
-        return ("motion", "content")
-    if isinstance(value, str):
-        value = [value]
-    feats = tuple(str(item).lower() for item in value)
-    unknown = [item for item in feats if item not in GATE_FEATURE_DIMS]
-    if unknown:
-        raise ValueError(f"Unknown tarq.gate_features entries {unknown}; valid: {list(GATE_FEATURE_DIMS)}")
-    if not feats:
-        raise ValueError("tarq.gate_features must not be empty")
-    return feats
-
 
 def _normalize_tarq_scope(value):
     if value is None:
@@ -74,9 +53,6 @@ def normalize_research_config(config=None):
             "num_groups": int(tarq.get("num_groups", 4)),
             "rank_per_group": int(tarq.get("rank_per_group", 1)),
             "apply_to": _normalize_tarq_scope(tarq.get("apply_to")),
-            "gate_features": _normalize_gate_features(tarq.get("gate_features")),
-            "transport_size": int(tarq.get("transport_size", 16)),
-            "descriptor_dim": int(tarq.get("descriptor_dim", 8)),
             "temperature": float(tarq.get("temperature", 0.07)),
             "rank_budget": float(tarq.get("rank_budget", 1.0)),
             "rank_budget_weight": float(tarq.get("rank_budget_weight", 1.0e-4)),
@@ -157,6 +133,9 @@ def _content_saliency(video):
 
 
 def _compact_transport_features(video, transport_size, descriptor_dim, temperature):
+    # Retained for analysis only (tools/verify_motion_hypothesis.py): the
+    # motivation experiments rejected motion as a TARQ gate signal, so this
+    # descriptor is no longer part of the quantization forward path.
     # video: [B, T, H, W, C]
     batch, frames, height, width, channels = video.shape
     size = min(transport_size, height, width)
@@ -198,57 +177,29 @@ def _compact_transport_features(video, transport_size, descriptor_dim, temperatu
     return torch.cat((first, features), dim=1)
 
 
-class BlockMotionContext:
-    """Per-transformer-block cache for TARQ motion features.
-
-    All TARQ branches inside one block describe the same token grid, so the
-    first branch that runs in a forward pass computes the motion descriptor
-    and the others reuse it.  A forward pre-hook on the owning block clears
-    the cache, which also keeps gradient-checkpoint recomputation correct
-    (the hook fires again on the recompute pass).
-    """
-
-    def __init__(self):
-        self._features = None
-
-    def clear(self, *_args, **_kwargs):
-        self._features = None
-
-    def get(self, batch, frames, spatial_tokens):
-        cached = self._features
-        if cached is None or cached.shape[:3] != (batch, frames, spatial_tokens):
-            return None
-        return cached
-
-    def set(self, features):
-        self._features = features
-
-
 class TrackAwareResidual(nn.Module):
+    """Token-saliency adaptive residual (TARQ).
+
+    Motivation experiments (tools/verify_motion_hypothesis.py) showed that
+    quantization-error structure is organized by token saliency (magnitude /
+    outlier statistics), not by motion; the expert gate therefore consumes
+    only the two content-saliency features.  Motion modeling lives solely in
+    the temporal axis (MTD).
+    """
     def __init__(self, in_features, out_features, research_config):
         super().__init__()
         config = normalize_research_config(research_config)
         tarq = config["tarq"]
         self.num_groups = tarq["num_groups"]
         self.rank_per_group = tarq["rank_per_group"]
-        self.transport_size = tarq["transport_size"]
-        self.descriptor_dim = tarq["descriptor_dim"]
         self.base_temperature = tarq["temperature"]
         self.rank_budget = tarq["rank_budget"]
         self.taq_enabled = config["diffusion_axis"] == "TAQ"
         self.num_bins = config["taq"]["num_bins"]
         self.down = nn.Parameter(torch.empty(self.num_groups, self.rank_per_group, in_features))
         self.up = nn.Parameter(torch.zeros(self.num_groups, out_features, self.rank_per_group))
-        # Learned projection for the transport descriptor.  Matching on an
-        # arbitrary slice of the first channels has no semantic selectivity;
-        # an orthogonally-initialized learned projection preserves distances at
-        # init and lets calibration pick motion-discriminative directions.
-        self.descriptor_proj = nn.Linear(in_features, min(self.descriptor_dim, in_features), bias=False)
-        self.gate_features = config["tarq"]["gate_features"]
-        gate_in = sum(GATE_FEATURE_DIMS[name] for name in self.gate_features)
-        self.gate = nn.Linear(gate_in, self.num_groups)
+        self.gate = nn.Linear(CONTENT_FEATURE_DIM, self.num_groups)
         nn.init.kaiming_uniform_(self.down, a=math.sqrt(5))
-        nn.init.orthogonal_(self.descriptor_proj.weight)
         nn.init.zeros_(self.gate.weight)
         nn.init.zeros_(self.gate.bias)
         if self.taq_enabled:
@@ -262,8 +213,6 @@ class TrackAwareResidual(nn.Module):
         self.trajectory_step_index = 0
         self.trajectory_num_steps = 1
         self.last_budget_loss = None
-        # Optional per-block shared motion cache (plain attribute, no params).
-        self.motion_context = None
 
     def set_trajectory_position(self, step_index, num_steps):
         self.trajectory_step_index = int(step_index)
@@ -326,9 +275,6 @@ class TrackAwareResidual(nn.Module):
         return gates, loss
 
     def forward(self, inputs, batch, frames, spatial_tokens, layout):
-        side = int(math.sqrt(spatial_tokens))
-        if side * side != spatial_tokens:
-            raise ValueError(f"TARQ requires a square spatial token grid, got {spatial_tokens}")
         if layout in ("spatial", "sequence"):
             # [B*T, S, C] and [B, T*S, C] share the same frame-major memory
             # order, so both reshape directly into [B, T, S, C].
@@ -337,32 +283,7 @@ class TrackAwareResidual(nn.Module):
             video = inputs.reshape(batch, spatial_tokens, frames, inputs.shape[-1]).permute(0, 2, 1, 3)
         else:
             raise ValueError(f"Unknown TARQ layout: {layout}")
-        feature_parts = []
-        if "motion" in self.gate_features:
-            motion = None
-            if self.motion_context is not None:
-                motion = self.motion_context.get(batch, frames, spatial_tokens)
-            if motion is None:
-                video_grid = video.reshape(batch, frames, side, side, inputs.shape[-1])
-                # The transport softmax keeps the fixed base temperature: TAQ
-                # modulates only gate sparsity, not the motion evidence itself.
-                descriptor_grid = F.linear(video_grid, self.descriptor_proj.weight.to(inputs.dtype))
-                motion = _compact_transport_features(
-                    descriptor_grid, self.transport_size, descriptor_grid.shape[-1], self.base_temperature
-                )
-                motion = motion.permute(0, 1, 4, 2, 3).reshape(
-                    batch * frames, MOTION_FEATURE_DIM, motion.shape[2], motion.shape[3]
-                )
-                motion = F.interpolate(motion, size=(side, side), mode="bilinear", align_corners=False)
-                motion = motion.reshape(batch, frames, MOTION_FEATURE_DIM, spatial_tokens).permute(0, 1, 3, 2)
-                if self.motion_context is not None:
-                    self.motion_context.set(motion)
-            feature_parts.append(motion)
-        if "content" in self.gate_features:
-            # Saliency features come from this layer's own input (unlike the
-            # motion descriptor they are layer-specific and nearly free).
-            feature_parts.append(_content_saliency(video))
-        gate_feats = feature_parts[0] if len(feature_parts) == 1 else torch.cat(feature_parts, dim=-1)
+        gate_feats = _content_saliency(video)
         gates, self.last_budget_loss = self._allocation_budget_loss(gate_feats)
         if not torch.is_grad_enabled():
             # Reentrant gradient checkpointing executes the original forward
