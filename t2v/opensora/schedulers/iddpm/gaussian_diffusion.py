@@ -690,13 +690,22 @@ class GaussianDiffusion:
                 
                 # timestep wise quant
                 qnn = model.args[0]
+                # Optional read-only profiling metadata.  The actual paired
+                # quantized/full-precision capture is performed inside
+                # forward_with_cfg at a small set of sampling progress steps.
+                qnn.mtd_profile_sampling_progress = int(self.num_timesteps - i)
+                qnn.mtd_profile_internal_timestep = int(i)
                 if getattr(qnn, "timestep_wise_quant", False):
                     if not qnn.layer_wise_quant and not qnn.group_wise_quant and not qnn.block_group_wise_quant:
                         if i <= qnn.quant_start_t and i >= qnn.quant_end_t:
                             if i == qnn.quant_start_t:
                                 qnn.set_quant_state(qnn.use_weight_quant, qnn.use_act_quant)
                                 logger.info(f"timestep wise quant: {qnn.quant_start_t}-{qnn.quant_end_t}")
-                                fp_layer_list = ['embedder', 'final', 't_block']
+                                fp_layer_list = getattr(
+                                    qnn,
+                                    "timestep_fp_layer_list",
+                                    ["x_embedder", "t_block", "t_embedder", "y_embedder", "final_layer"],
+                                )
                                 qnn.set_layer_quant(model=qnn, module_name_list=fp_layer_list, quant_level='per_layer', weight_quant=False, act_quant=False, prefix="")
                         else:
                             qnn.set_quant_state(False, False)
@@ -736,6 +745,16 @@ class GaussianDiffusion:
                                 qnn.set_layer_quant(model=qnn, module_name_list=qnn.quant_layer_name, quant_level='per_layer', weight_quant=qnn.use_weight_quant, act_quant=qnn.use_act_quant, prefix="")
                         else:
                             qnn.set_quant_state(False, False)
+
+                    if hasattr(qnn, "quant_window_trace"):
+                        in_window = qnn.quant_end_t <= i <= qnn.quant_start_t
+                        qnn.quant_window_trace.append({
+                            "internal_timestep": int(i),
+                            "sampling_progress": int(self.num_timesteps - i),
+                            "in_quant_window": bool(in_window),
+                            "weight_quant": bool(in_window and qnn.use_weight_quant),
+                            "act_quant": bool(in_window and qnn.use_act_quant),
+                        })
 
                 if getattr(qnn, 'timestep_wise_mp', False):
                     key = get_key_for_value(qnn.time_mp_config_weight, i)

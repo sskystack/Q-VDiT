@@ -1,0 +1,18 @@
+# Python and macOS-generated files
+__pycache__/
+*.py[cod]
+.DS_Store
+.pytest_cache/
+
+# Local experiments and generated outputs
+logs*/
+profiling_backups/
+.codex_backup*/
+*.mp4
+*.pt
+*.pth
+*.pth.tar
+
+# Local profiling scratch files
+*.bak_output_gradient_*
+*.bak_*

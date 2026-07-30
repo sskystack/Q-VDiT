@@ -1,0 +1,24 @@
+{
+  "seed": 42,
+  "prompt_file": "/home/zhouchongtian/quantization/qvdit_flash_bf16/t2v/assets/texts/vbench_official/subject_consistency.txt",
+  "flip_1to0": [
+    {"index": 63, "prompt": "a bear sniffing the air for scents of food"},
+    {"index": 11, "prompt": "a car stuck in traffic during rush hour"},
+    {"index": 5, "prompt": "a person drinking coffee in a cafe"},
+    {"index": 53, "prompt": "a sheep bending down to drink water from a river"},
+    {"index": 54, "prompt": "a sheep taking a peaceful walk"},
+    {"index": 27, "prompt": "a train speeding down the tracks"},
+    {"index": 20, "prompt": "an airplane soaring through a clear blue sky"},
+    {"index": 59, "prompt": "an elephant spraying itself with water using its trunk to cool down"}
+  ],
+  "control_both_true": [
+    {"index": 65, "prompt": "a bear hunting for prey"},
+    {"index": 14, "prompt": "a car accelerating to gain speed"},
+    {"index": 48, "prompt": "a dog running happily"},
+    {"index": 50, "prompt": "a horse galloping across an open field"},
+    {"index": 29, "prompt": "a train accelerating to gain speed"},
+    {"index": 34, "prompt": "a truck accelerating to gain speed"},
+    {"index": 21, "prompt": "an airplane taking off"},
+    {"index": 61, "prompt": "an elephant running to join a herd of its kind"}
+  ]
+}

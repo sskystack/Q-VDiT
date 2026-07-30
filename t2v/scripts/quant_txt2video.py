@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 # sys.path.append(".")
 
 import torch
@@ -75,8 +76,41 @@ def main():
     print(dtype)
     
     set_random_seed(seed=cfg.seed)
-    prompts = load_prompts(cfg.prompt_path)
-    prompts = prompts[:cfg.num_videos]
+    all_prompts = load_prompts(cfg.prompt_path)
+    prompt_start_index = int(cfg.get("prompt_start_index", 0))
+    requested_prompt_indices = cfg.get("prompt_indices", None)
+    replay_original_prompt_rng = bool(cfg.get("replay_original_prompt_rng", False))
+    if requested_prompt_indices:
+        original_prompt_indices = [int(index) for index in requested_prompt_indices]
+        invalid = [
+            index for index in original_prompt_indices
+            if not (0 <= index < len(all_prompts))
+        ]
+        if invalid:
+            raise ValueError(
+                f"prompt_indices contains values outside [0, {len(all_prompts)}): {invalid}"
+            )
+        if replay_original_prompt_rng:
+            if int(cfg.batch_size) != 1:
+                raise ValueError("replay_original_prompt_rng requires batch_size=1")
+            if original_prompt_indices != sorted(original_prompt_indices):
+                raise ValueError(
+                    "replay_original_prompt_rng requires strictly increasing prompt_indices"
+                )
+            if len(set(original_prompt_indices)) != len(original_prompt_indices):
+                raise ValueError(
+                    "replay_original_prompt_rng does not allow duplicate prompt_indices"
+                )
+        prompts = [all_prompts[index] for index in original_prompt_indices]
+    else:
+        prompt_end_index = prompt_start_index + int(cfg.num_videos)
+        if not (0 <= prompt_start_index < len(all_prompts)):
+            raise ValueError(
+                f"prompt_start_index={prompt_start_index} is outside prompt file "
+                f"with {len(all_prompts)} entries"
+            )
+        original_prompt_indices = list(range(prompt_start_index, prompt_end_index))
+        prompts = all_prompts[prompt_start_index:prompt_end_index]
 
     # ======================================================
     # 3. build model & load weights
@@ -122,7 +156,10 @@ def main():
     # ======================================================
     # 4. get quantized model
     # ======================================================
-    num_timesteps = config.calib_data.n_steps
+    # Use the actual inference scheduler length. The calibration YAML may have
+    # been collected with a different number of steps (for example 50-step
+    # calibration followed by 100-step inference).
+    num_sampling_timesteps = int(scheduler.num_timesteps)
 
     assert(config.conditional)
 
@@ -217,22 +254,167 @@ def main():
 
     load_quant_params(qnn, opt.quant_ckpt)
     qnn.cuda()
-    qnn.to(dtype)
+    # The backbone was already moved to the requested inference dtype before
+    # QuantModel wrapping.  Keep TQE master weights and static weight-quantizer
+    # parameters in FP32, matching calib.py. QuantLayer casts the final
+    # effective weight to the hidden-state dtype immediately before GEMM.
+    # Casting the whole qnn to FP16 here can overflow optimized TQE/quantizer
+    # intermediates even though the resulting linear output is representable.
+    if dtype == torch.float32:
+        qnn.to(dtype)
 
     # ======================================================
     # 5. inference
     # ======================================================
-    qnn.timestep_wise_quant =False
+    qnn.use_weight_quant = use_weight_quant
+    qnn.use_act_quant = use_act_quant
+    qnn.layer_wise_quant = bool(opt.layer_wise_quant)
+    qnn.group_wise_quant = bool(opt.group_wise_quant)
+    qnn.block_group_wise_quant = bool(opt.block_group_wise_quant)
+    qnn.timestep_wise_quant = bool(opt.timestep_wise_quant)
+    qnn.timestep_fp_layer_list = (
+        fp_layer_list
+        if opt.part_fp
+        else ["x_embedder", "t_block", "t_embedder", "y_embedder", "final_layer"]
+    )
+    qnn.mtd_profile_enabled = bool(opt.get("mtd_profile_dir", None))
+    qnn.mtd_profile_dir = opt.get("mtd_profile_dir", None)
+    qnn.mtd_profile_steps = set(
+        int(step) for step in (opt.get("mtd_profile_steps", None) or [])
+    )
+    qnn.mtd_profile_transport_size = int(
+        opt.get("mtd_profile_transport_size", 16)
+    )
+    if qnn.mtd_profile_enabled:
+        if not qnn.mtd_profile_steps:
+            raise ValueError("--mtd_profile_dir requires --mtd_profile_steps")
+        invalid_steps = [
+            step for step in qnn.mtd_profile_steps
+            if not (1 <= step <= num_sampling_timesteps)
+        ]
+        if invalid_steps:
+            raise ValueError(
+                f"mtd_profile_steps outside [1, {num_sampling_timesteps}]: {invalid_steps}"
+            )
+        os.makedirs(qnn.mtd_profile_dir, exist_ok=True)
+
+    if qnn.timestep_wise_quant:
+        progress_start = opt.quant_progress_start
+        progress_end = opt.quant_progress_end
+        if progress_start is None or progress_end is None:
+            raise ValueError(
+                "--timestep_wise_quant requires --quant_progress_start and "
+                "--quant_progress_end"
+            )
+        if not (1 <= progress_start <= progress_end <= num_sampling_timesteps):
+            raise ValueError(
+                f"invalid progress window [{progress_start}, {progress_end}] for "
+                f"{num_sampling_timesteps} sampling steps"
+            )
+        # Sampling progress is 1..N, while the DDIM loop visits N-1..0.
+        qnn.quant_start_t = num_sampling_timesteps - progress_start
+        qnn.quant_end_t = num_sampling_timesteps - progress_end
+        # The loop must begin in FP and enable quantization only on entry.
+        qnn.set_quant_state(False, False)
+        logger.info(
+            "Experiment-B timestep window: progress [%d, %d] -> internal [%d, %d], "
+            "weight_quant=%s, act_quant=%s",
+            progress_start,
+            progress_end,
+            qnn.quant_start_t,
+            qnn.quant_end_t,
+            qnn.use_weight_quant,
+            qnn.use_act_quant,
+        )
+
+    metadata = {
+        "seed": int(cfg.seed),
+        "num_sampling_steps": int(num_sampling_timesteps),
+        "timestep_wise_quant": bool(qnn.timestep_wise_quant),
+        "weight_quant": bool(qnn.use_weight_quant),
+        "act_quant": bool(qnn.use_act_quant),
+        "progress_start": opt.get("quant_progress_start", None),
+        "progress_end": opt.get("quant_progress_end", None),
+        "internal_start": getattr(qnn, "quant_start_t", None),
+        "internal_end": getattr(qnn, "quant_end_t", None),
+        "quant_ckpt": str(opt.quant_ckpt),
+        "prompt_start_index": prompt_start_index,
+        "prompt_indices": original_prompt_indices,
+        "prompt_count": len(prompts),
+        "mtd_profile_steps": sorted(qnn.mtd_profile_steps),
+    }
+    with open(os.path.join(outpath, "experiment_b_metadata.json"), "w") as f:
+        json.dump(metadata, f, indent=2)
+
     sample_idx = 0
     save_dir = opt.save_dir
     os.makedirs(save_dir, exist_ok=True)
     if PRECOMPUTE_TEXT_EMBEDS is not None:
         model_args['precompute_text_embeds'] = torch.load(cfg.precompute_text_embeds)
     print(cfg.batch_size)
+    replay_cursor = 0
     for i in range(0, len(prompts), cfg.batch_size):
+        qnn.quant_window_trace = []
         batch_prompts = prompts[i : i + cfg.batch_size]
+        batch_original_indices = original_prompt_indices[i : i + cfg.batch_size]
+        if requested_prompt_indices and replay_original_prompt_rng:
+            original_index = int(batch_original_indices[0])
+            skipped_prompts = original_index - replay_cursor
+            if skipped_prompts < 0:
+                raise RuntimeError(
+                    f"RNG replay cursor moved backwards: cursor={replay_cursor}, "
+                    f"prompt_index={original_index}"
+                )
+            for _ in range(skipped_prompts):
+                torch.randn(
+                    1,
+                    vae.out_channels,
+                    *latent_size,
+                    device=device,
+                )
+                for _ in range(num_sampling_timesteps):
+                    torch.randn(
+                        2,
+                        vae.out_channels,
+                        *latent_size,
+                        device=device,
+                    )
+            init_noise = None
+            replay_cursor = original_index + 1
+        elif requested_prompt_indices:
+            per_prompt_noise = []
+            for original_index in batch_original_indices:
+                noise_generator = torch.Generator(device=device)
+                noise_generator.manual_seed(int(cfg.seed) + int(original_index))
+                per_prompt_noise.append(torch.randn(
+                    1,
+                    vae.out_channels,
+                    *latent_size,
+                    device=device,
+                    generator=noise_generator,
+                ))
+            init_noise = torch.cat(per_prompt_noise, dim=0)
+        else:
+            noise_generator = torch.Generator(device=device)
+            noise_generator.manual_seed(int(cfg.seed) + i)
+            init_noise = torch.randn(
+                len(batch_prompts),
+                vae.out_channels,
+                *latent_size,
+                device=device,
+                generator=noise_generator,
+            )
+        qnn.mtd_profile_prompt_names = list(batch_prompts)
+        qnn.mtd_profile_prompt_indices = list(batch_original_indices)
+        if opt.save_init_noise:
+            noise_dir = os.path.join(outpath, "init_noise")
+            os.makedirs(noise_dir, exist_ok=True)
+            torch.save(
+                init_noise.detach().float().cpu(),
+                os.path.join(noise_dir, f"init_noise_{i:04d}.pt"),
+            )
         if PRECOMPUTE_TEXT_EMBEDS is not None:  # also feed in the idxs for saved text_embeds
-            model_args['batch_ids'] = torch.arange(i,i+cfg.batch_size)
+            model_args['batch_ids'] = torch.tensor(batch_original_indices)
         samples = scheduler.sample(
             qnn,
             text_encoder,
@@ -241,13 +423,28 @@ def main():
             prompts=batch_prompts,
             device=device,
             additional_args=model_args,
+            init_noise=init_noise,
         )
+        if opt.save_final_latent:
+            latent_dir = os.path.join(outpath, "final_latents")
+            os.makedirs(latent_dir, exist_ok=True)
+            for latent_idx, latent in enumerate(samples):
+                torch.save(
+                    latent.detach().float().cpu(),
+                    os.path.join(latent_dir, f"final_latent_{sample_idx + latent_idx:04d}.pt"),
+                )
+        if opt.save_quant_trace:
+            trace_path = os.path.join(outpath, f"quant_trace_batch_{i:04d}.json")
+            with open(trace_path, "w") as f:
+                json.dump(qnn.quant_window_trace, f, indent=2)
         samples = vae.decode(samples.to(dtype))
 
         for idx, sample in enumerate(samples):
             print(f"Prompt: {batch_prompts[idx]}")
-            save_path = os.path.join(save_dir, f"sample_{sample_idx}")
-            # save_path = os.path.join(save_dir, f"{batch_prompts[idx]}-0")
+            if cfg.get("prompt_as_path", False):
+                save_path = os.path.join(save_dir, batch_prompts[idx])
+            else:
+                save_path = os.path.join(save_dir, f"sample_{sample_idx}")
             save_sample(sample, fps=cfg.fps, save_path=save_path)
             sample_idx += 1
 

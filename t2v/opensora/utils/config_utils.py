@@ -29,6 +29,11 @@ def parse_args(training=False, mode=None):
         # prompt
         parser.add_argument("--prompt_path", default=None, type=str, help="path to prompt txt file")
         parser.add_argument("--save_dir", default=None, type=str, help="path to save generated samples, if leave empty, is outdir/generated_videos")
+        parser.add_argument(
+            "--prompt_as_path",
+            action="store_true",
+            help="use the prompt text as the output filename for VBench matching",
+        )
         # hyperparameters
         parser.add_argument("--num_sampling_steps", default=None, type=int, help="sampling steps")
         parser.add_argument("--cfg_scale", default=None, type=float, help="balance between cond & uncond")
@@ -45,6 +50,45 @@ def parse_args(training=False, mode=None):
         parser.add_argument("--save_inp_oup", action="store_true")
     elif mode == 'ptq':
         parser.add_argument("--calib_data", default=None, type=str, help="path to quantization calib data")
+        parser.add_argument(
+            "--resume_reconstruction",
+            default=None,
+            type=str,
+            help="path to reconstruction_state_latest.pth for exact optimizer resume",
+        )
+        parser.add_argument(
+            "--reconstruction_checkpoint_interval",
+            default=None,
+            type=int,
+            help="override the reconstruction checkpoint interval from the quant config",
+        )
+        parser.add_argument(
+            "--numeric_monitor_interval",
+            default=0,
+            type=int,
+            help="write aggregate numerical statistics every N reconstruction steps; 0 disables",
+        )
+        parser.add_argument(
+            "--numeric_monitor_detailed_interval",
+            default=100,
+            type=int,
+            help="write per-parameter and Adam-state statistics every N steps",
+        )
+        parser.add_argument(
+            "--use_grad_scaler",
+            action="store_true",
+            help="use dynamic loss scaling for FP16 reconstruction backward",
+        )
+        parser.add_argument(
+            "--paired_gradient_probe_scale",
+            default=0.0,
+            type=float,
+            help=(
+                "at the first reconstruction step, compare ordinary backward "
+                "against manually loss-scaled backward without changing the update; "
+                "0 disables"
+            ),
+        )
     elif mode == "quant_inference":
         parser.add_argument("--dataset_type", default="opensora", type=str)
         parser.add_argument(
@@ -89,6 +133,51 @@ def parse_args(training=False, mode=None):
             help="number of generated videos",
         )
         parser.add_argument(
+            "--prompt_start_index",
+            type=int,
+            default=0,
+            help="0-based first prompt and precomputed-embedding index to use",
+        )
+        parser.add_argument(
+            "--prompt_indices",
+            nargs="+",
+            type=int,
+            default=None,
+            help=(
+                "optional non-contiguous prompt indices; preserves the original "
+                "prompt embedding and per-prompt seed mapping"
+            ),
+        )
+        parser.add_argument(
+            "--replay_original_prompt_rng",
+            action="store_true",
+            help=(
+                "for non-contiguous prompt_indices, reproduce the original full-run "
+                "global CUDA RNG stream by consuming the skipped prompts' DDIM "
+                "random draws without evaluating the model; requires batch_size=1 "
+                "and strictly increasing prompt indices"
+            ),
+        )
+        parser.add_argument(
+            "--mtd_profile_dir",
+            type=str,
+            default=None,
+            help="save paired quantized/full-precision model outputs for MTD profiling",
+        )
+        parser.add_argument(
+            "--mtd_profile_steps",
+            nargs="+",
+            type=int,
+            default=None,
+            help="1-based sampling progress steps at which to capture MTD features",
+        )
+        parser.add_argument(
+            "--mtd_profile_transport_size",
+            type=int,
+            default=16,
+            help="spatial size used when saving pooled MTD profiling features",
+        )
+        parser.add_argument(
             "--layer_wise_quant",
             action="store_true",
             help="whether only quant a part of layers",
@@ -102,6 +191,33 @@ def parse_args(training=False, mode=None):
             "--timestep_wise_quant",
             action="store_true",
             help="whether only quant a part of timesteps",
+        )
+        parser.add_argument(
+            "--quant_progress_start",
+            type=int,
+            default=None,
+            help="first 1-based sampling progress step to quantize (inclusive)",
+        )
+        parser.add_argument(
+            "--quant_progress_end",
+            type=int,
+            default=None,
+            help="last 1-based sampling progress step to quantize (inclusive)",
+        )
+        parser.add_argument(
+            "--save_final_latent",
+            action="store_true",
+            help="save the final latent before VAE decoding",
+        )
+        parser.add_argument(
+            "--save_quant_trace",
+            action="store_true",
+            help="save the actual per-step timestep-window quantization trace",
+        )
+        parser.add_argument(
+            "--save_init_noise",
+            action="store_true",
+            help="save deterministic initial noise used by each inference batch",
         )
         parser.add_argument(
             "--block_group_wise_quant",
@@ -189,6 +305,9 @@ def merge_args(cfg, args, training=False, mode=None):
         if args.ckpt_path is not None:
             cfg.model["from_pretrained"] = args.ckpt_path
     if not training:
+        if hasattr(args, "num_sampling_steps"):
+            if args.num_sampling_steps is not None:
+                cfg.scheduler["num_sampling_steps"] = args.num_sampling_steps
         if hasattr(args, "cfg_scale"):
             if args.cfg_scale is not None:
                 cfg.scheduler["cfg_scale"] = args.cfg_scale

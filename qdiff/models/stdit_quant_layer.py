@@ -1,7 +1,7 @@
 import logging
 import torch
 from qdiff.quantizer.base_quantizer import WeightQuantizer, ActQuantizer, StraightThrough, round_ste
-from qdiff.models.quant_layer import QuantLayer, find_interval
+from qdiff.models.quant_layer import QuantLayer, find_interval, cast_linear_operands
 from omegaconf import ListConfig
 import copy
 import torch.nn as nn
@@ -110,9 +110,7 @@ class QuantSpatialAttnLinear(QuantLayer):
                 weight = self.weight
             bias = self.bias
 
-        if weight.dtype == torch.float32 and input.dtype == torch.float16:
-            weight = weight.to(torch.float16)
-
+        weight, bias = cast_linear_operands(input, weight, bias)
         # import ipdb; ipdb.set_trace()
         out = self.fwd_func(input, weight, bias, **self.fwd_kwargs)
         out = self.activation_function(out)
@@ -220,13 +218,12 @@ class QuantTemporalAttnLinear(QuantLayer):
                 weight = self.weight
             bias = self.bias
 
-        if weight.dtype == torch.float32 and input.dtype == torch.float16:
-            weight = weight.to(torch.float16)
-
+        weight, bias = cast_linear_operands(input, weight, bias)
         out = self.fwd_func(input, weight, bias, **self.fwd_kwargs)
         if self.weight_quant:
+            lora_weight_out, _ = cast_linear_operands(input, lora_weight_out)
             out_lora = self.fwd_func(input, lora_weight_out, **self.fwd_kwargs)
-            out_lora = out_lora * self.mask
+            out_lora = out_lora * self.mask.to(out_lora.dtype)
             out = out + out_lora
         out = self.activation_function(out)
 
@@ -357,9 +354,7 @@ class QuantCrossAttnLinear(QuantLayer):
                 weight = self.weight
             bias = self.bias
 
-        if weight.dtype == torch.float32 and input.dtype == torch.float16:
-            weight = weight.to(torch.float16)
-
+        weight, bias = cast_linear_operands(input, weight, bias)
         out = self.fwd_func(input, weight, bias, **self.fwd_kwargs)
         out = self.activation_function(out)
 
@@ -368,5 +363,4 @@ class QuantCrossAttnLinear(QuantLayer):
             import ipdb; ipdb.set_trace()
 
         return out
-
 

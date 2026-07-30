@@ -21,6 +21,18 @@ from qdiff.models.quant_model import QuantModel
 from qdiff.quantizer.base_quantizer import BaseQuantizer, WeightQuantizer, ActQuantizer
 from qdiff.utils import get_quant_calib_data
 from qdiff.optimization.model_recon import our_model_reconstruction
+from qdiff.memory_profile import (
+    configure_memory_profiler,
+    finish_memory_profiler,
+    mark_memory,
+    record_memory_oom,
+)
+from qdiff.calib_numeric_profiler import (
+    finish_calib_numeric_profiler,
+    record_calib_numeric_comparison,
+    set_calib_numeric_phase,
+    start_calib_numeric_profiler,
+)
 
 logger = logging.getLogger(__name__)
 # os.environ["CUDA_LAUNCH_BLOCKING"]="1"
@@ -47,17 +59,41 @@ def main():
     shutil.copytree('./qdiff', os.path.join(outpath,'qdiff'))
 
     log_path = os.path.join(outpath, "run.log")
+    resume_reconstruction = cfg.get('resume_reconstruction', None)
     logging.basicConfig(
         format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
         datefmt='%m/%d/%Y %H:%M:%S',
         level=logging.INFO,
         handlers=[
-            logging.FileHandler(log_path, mode='w'),
+            logging.FileHandler(log_path, mode='a' if resume_reconstruction else 'w'),
             logging.StreamHandler()
         ]
     )
     logger = logging.getLogger(__name__)
     config = OmegaConf.load(f"{opt.calib_config}")
+    config.reconstruction_checkpoint_dir = outpath
+    config.resume_reconstruction = resume_reconstruction
+    config.numeric_monitor_interval = int(
+        cfg.get('numeric_monitor_interval', 0) or 0
+    )
+    config.numeric_monitor_detailed_interval = int(
+        cfg.get('numeric_monitor_detailed_interval', 100) or 100
+    )
+    config.use_grad_scaler = bool(cfg.get('use_grad_scaler', False))
+    config.paired_gradient_probe_scale = float(
+        cfg.get('paired_gradient_probe_scale', 0.0) or 0.0
+    )
+    checkpoint_interval_override = cfg.get(
+        'reconstruction_checkpoint_interval', None
+    )
+    if checkpoint_interval_override is not None:
+        if checkpoint_interval_override < 0:
+            raise ValueError(
+                "reconstruction_checkpoint_interval must be non-negative"
+            )
+        config.quant.weight.optimization.checkpoint_interval = (
+            checkpoint_interval_override
+        )
     logger.info("Conducting Command: %s", " ".join(sys.argv))
 
     # ======================================================
@@ -69,6 +105,8 @@ def main():
     device = f"cuda" if torch.cuda.is_available() else "cpu"
     gpus = [int(d) for d in cfg.gpu.split(",")]
     torch.cuda.set_device(gpus[0])
+    configure_memory_profiler(outpath)
+    mark_memory("runtime_initialized")
     
     dtype = to_torch_dtype(cfg.dtype)
     set_random_seed(seed=cfg.seed)
@@ -92,6 +130,7 @@ def main():
         dtype=dtype,
         enable_sequence_parallelism=False,
     )
+    mark_memory("model_built_on_cpu", model=model, vae=vae)
     if PRECOMPUTE_TEXT_EMBEDS is not None:
         text_encoder = None
     else:
@@ -100,6 +139,7 @@ def main():
     # 3.3. move to device & eval
     vae = vae.to(device, dtype).eval()
     model = model.to(device, dtype).eval()
+    mark_memory("model_and_vae_moved_to_gpu", model=model, vae=vae)
     # 3.4. support for multi-resolution
     model_args = dict()
     if cfg.multi_resolution:
@@ -154,6 +194,16 @@ def main():
     )
     qnn.cuda()
     qnn.eval()
+    mark_memory("quant_model_wrapped", qnn=qnn, vae=vae)
+    # Calibration operates entirely in latent space. The VAE is needed only
+    # to derive latent_size/out_channels above and is never called afterwards.
+    # Releasing it is value-preserving and saves its full GPU footprint,
+    # especially in the official FP32 calibration path.
+    del vae
+    del model
+    gc.collect()
+    torch.cuda.empty_cache()
+    mark_memory("vae_released_after_shape_setup", qnn=qnn)
     logger.info(qnn)
 
     # DIRTY: set the cfg_split as the attribute of the model
@@ -170,8 +220,10 @@ def main():
     if hasattr(cfg,"calib_data"):
         if cfg.calib_data is not None:
             config.calib_data.path = cfg.calib_data
+    mark_memory("before_calibration_data_load", qnn=qnn)
     calib_data_ckpt = torch.load(config.calib_data.path, map_location='cpu')
     calib_data = get_quant_calib_data(config, calib_data_ckpt, config.calib_data.n_steps, model_type=config.model.model_type, repeat_interleave=cfg.get('timestep_wise',False))
+    mark_memory("calibration_data_selected_on_cpu", qnn=qnn, calib_data=calib_data)
     del(calib_data_ckpt)
     gc.collect()
 
@@ -213,6 +265,7 @@ def main():
             tmp_kwargs = calib_added_kwargs
 
         qnn.set_module_name_for_quantizer(module=qnn.model)  # add the module name as attribute for each quantizer
+        start_calib_numeric_profiler(qnn, outpath)
         # _ = qnn(calib_xs[:calib_batch_size].cuda(), calib_ts[:calib_batch_size].cuda(), calib_cs[:calib_batch_size].cuda(), **tmp_kwargs)
         
         ## for w4a8 mixpricision
@@ -284,6 +337,12 @@ def main():
         else:
             qnn.set_quant_state(True, False) # enable weight quantization, disable act quantization
 
+        mark_memory(
+            "before_weight_quantizer_initialization_forward",
+            qnn=qnn,
+            calib_data=calib_data,
+        )
+        set_calib_numeric_phase("weight_quantizer_initialization")
         # For smooth quant with multiple timerange, should save many weights
         if aq_params.smooth_quant.enable:
             if aq_params.smooth_quant.get('timerange', None) is not None:
@@ -303,6 +362,7 @@ def main():
         logger.info("weight initialization done!")
         qnn.set_quant_init_done('weight')
         torch.cuda.empty_cache()
+        mark_memory("weight_quantizer_initialized", qnn=qnn)
 
         # --- the activation quantization -----
         # by default, use the running_mean of calibration data to determine activation quant params
@@ -314,6 +374,7 @@ def main():
         else:
             qnn.set_quant_state(True, True) # quantize activation with fixed quantized weight
         logger.info('Running stat for activation quantization')
+        set_calib_numeric_phase("activation_quantizer_initialization")
 
 
         if aq_params.get('dynamic',False):
@@ -372,6 +433,44 @@ def main():
         qnn.set_quant_init_done('activation')
         logger.info("activation initialization done!")
         torch.cuda.empty_cache()
+        mark_memory("activation_quantizer_initialized", qnn=qnn)
+
+        # Read-only paired probes on the exact same calibration mini-batch.
+        # Reconstruction below disables activation quantization, while formal
+        # inference enables dynamic A6.  Measuring FP -> W4 -> W4A6 here makes
+        # that calibration/inference gap explicit without changing parameters.
+        probe_x = calib_xs[:calib_batch_size].cuda()
+        probe_t = calib_ts[:calib_batch_size].cuda()
+        probe_c = calib_cs[:calib_batch_size].cuda()
+
+        def set_probe_quant_state(weight_quant, act_quant):
+            qnn.set_quant_state(weight_quant, act_quant)
+            if opt.part_fp:
+                qnn.set_layer_quant(
+                    model=qnn,
+                    module_name_list=fp_layer_list,
+                    quant_level='per_layer',
+                    weight_quant=False,
+                    act_quant=False,
+                    prefix="",
+                )
+
+        set_probe_quant_state(False, False)
+        set_calib_numeric_phase("paired_probe_fp16_full_precision")
+        probe_fp = qnn(probe_x, probe_t, probe_c, **tmp_kwargs)
+
+        set_probe_quant_state(True, False)
+        set_calib_numeric_phase("paired_probe_w4")
+        probe_w4 = qnn(probe_x, probe_t, probe_c, **tmp_kwargs)
+        record_calib_numeric_comparison("w4_vs_fp", probe_fp, probe_w4)
+
+        set_probe_quant_state(True, True)
+        set_calib_numeric_phase("paired_probe_w4a6")
+        probe_w4a6 = qnn(probe_x, probe_t, probe_c, **tmp_kwargs)
+        record_calib_numeric_comparison("w4a6_vs_fp", probe_fp, probe_w4a6)
+        record_calib_numeric_comparison("w4a6_vs_w4", probe_w4, probe_w4a6)
+        del probe_fp, probe_w4, probe_w4a6, probe_x, probe_t, probe_c
+        torch.cuda.empty_cache()
 
     # ----------------------- get the quant params (training opt), using the calibration data -------------------------------------
     # import ipdb; ipdb.set_trace()
@@ -401,7 +500,9 @@ def main():
             opt_d['activation'] = getattr(config.quant,'activation').optimization.params.keys()
         else:
             opt_d['activation'] = None
+        mark_memory("before_quant_buffers_to_parameters", qnn=qnn)
         qnn.replace_quant_buffer_with_parameter(opt_d)
+        mark_memory("after_quant_buffers_to_parameters", qnn=qnn)
 
 
         # --- the weight quantization (with optimization) -----
@@ -414,9 +515,15 @@ def main():
             param_types = list(config.quant.weight.optimization.params.keys())
             if 'alpha' in param_types:
                 assert config.quant.weight.quantizer.round_mode == 'learned_hard_sigmoid'  # check adaround stat
+            mark_memory("reconstruction_start", qnn=qnn, calib_data=calib_data)
+            set_calib_numeric_phase("reconstruction_cache_and_optimization")
             our_model_reconstruction(qnn,qnn,calib_data,config,param_types,opt_target)  # DEBUG_ONLY
+            mark_memory("reconstruction_complete", qnn=qnn, calib_data=calib_data)
             logger.info("Finished optimizing param {} for layer's {}, saving temporary checkpoint...".format(param_types, opt_target))
-            torch.save(qnn.get_quant_params_dict(), os.path.join(outpath, "ckpt.pth"))
+            torch.save(
+                qnn.get_inference_quant_params_dict(),
+                os.path.join(outpath, "ckpt.pth"),
+            )
 
         # --- the activation quantization (with optimization) -----
         if not act_optimization:
@@ -430,9 +537,22 @@ def main():
 
     # save the quant params
     logger.info("Saving calibrated quantized DiT model")
+    set_calib_numeric_phase("final_checkpoint")
+    mark_memory("before_final_checkpoint_pack", qnn=qnn)
     quant_params_dict = qnn.get_quant_params_dict()
     # import ipdb; ipdb.set_trace()
     torch.save(quant_params_dict, os.path.join(outpath, "ckpt.pth"))
+    mark_memory("checkpoint_saved", qnn=qnn, quant_params=quant_params_dict)
+    finish_calib_numeric_profiler()
+    finish_memory_profiler()
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (torch.cuda.OutOfMemoryError, RuntimeError) as error:
+        is_oom = isinstance(error, torch.cuda.OutOfMemoryError) or (
+            "out of memory" in str(error).lower()
+        )
+        if is_oom:
+            record_memory_oom(error)
+        raise

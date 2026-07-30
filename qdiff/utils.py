@@ -11,6 +11,7 @@ from qdiff.models.quant_layer import QuantLayer
 from qdiff.models.quant_block import BaseQuantBlock
 from qdiff.models.quant_model import QuantModel
 from qdiff.quantizer.base_quantizer import BaseQuantizer, lp_loss
+from qdiff.mtd import motion_transport_distillation, normalize_mtd_config
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +140,7 @@ class LossFunction:
                  module_type='layer',
                  use_reconstruction_loss=False,
                  use_round_loss=False,
+                 mtd_config=None,
                  ):
 
         self.module = module
@@ -152,6 +154,7 @@ class LossFunction:
         self.p = p
         self.use_reconstruction_loss = use_reconstruction_loss
         self.use_round_loss = use_round_loss
+        self.mtd_config = normalize_mtd_config(mtd_config)
 
         self.temp_decay = LinearTempDecay(iters, rel_start_decay=warmup + (1 - warmup) * decay_start,
                                           start_b=b_range[0], end_b=b_range[1])
@@ -168,6 +171,16 @@ class LossFunction:
         :param grad: gradients to compute fisher information
         :return: total loss function
         """
+        # FlashAttention runs the transformer in BF16/FP16, but reconstruction
+        # reductions are substantially more stable in FP32.  These casts are
+        # placed only at the terminal loss boundary, so backward automatically
+        # casts gradients back to the transformer's compute dtype before they
+        # reach the FlashAttention kernel.
+        pred = pred.float()
+        tgt = tgt.float()
+        if grad is not None:
+            grad = grad.float()
+
         total_loss = 0.
 
         self.count += 1
@@ -193,6 +206,10 @@ class LossFunction:
         else:
             reconstruction_loss = 0.
 
+        mtd_loss, mtd_terms = motion_transport_distillation(
+            pred, tgt, self.mtd_config, return_components=True
+        )
+
         b = self.temp_decay(self.count)
         if self.use_round_loss:
             if self.count < self.loss_start or self.round_loss_type == 'none':
@@ -216,11 +233,42 @@ class LossFunction:
 
         total_loss += reconstruction_loss
         total_loss += round_loss
-        if self.count % 100 == 0:
+        total_loss += mtd_loss
+        # Keep graph-connected component tensors available to diagnostics in
+        # the reconstruction loop.  They are cleared immediately after the
+        # backward pass there, so this does not retain graphs across steps.
+        self.last_component_tensors = {
+            'reconstruction': reconstruction_loss,
+            'mtd': mtd_loss,
+            'mtd_local': mtd_terms['local'],
+            'mtd_motion': mtd_terms['motion'],
+            'mtd_global': mtd_terms['global'],
+            'round': round_loss,
+            'total': total_loss,
+        }
+        self.last_components = {
+            'reconstruction': float(reconstruction_loss),
+            'mtd': float(mtd_loss),
+            'mtd_local': float(mtd_terms['local']),
+            'mtd_motion': float(mtd_terms['motion']),
+            'mtd_global': float(mtd_terms['global']),
+            'round': float(round_loss),
+            'total': float(total_loss),
+        }
+        if self.count == 1 or self.count % 100 == 0:
             reconstruction_loss = -1 if not self.use_reconstruction_loss else reconstruction_loss
             round_loss = -1 if not self.use_round_loss else round_loss
-            logger.info('Total loss:\t{:.6f} (rec:{:.6f}, round:{:.6})\tb={:.2f}\tcount={}'.format(
-                  float(total_loss), float(reconstruction_loss), float(round_loss), b, self.count))
+            logger.info(
+                'Total loss:\t{:.6f} '
+                '(rec:{:.6f}, mtd:{:.6f} [local:{:.6f}, motion:{:.6f}, '
+                'global:{:.6f}], round:{:.6})'
+                '\tb={:.2f}\tcount={}'.format(
+                    float(total_loss), float(reconstruction_loss), float(mtd_loss),
+                    float(mtd_terms['local']), float(mtd_terms['motion']),
+                    float(mtd_terms['global']),
+                    float(round_loss), b, self.count
+                )
+            )
         return total_loss
 
 
@@ -283,6 +331,13 @@ def save_in_out_data(model: QuantModel, layer: Union[QuantLayer, BaseQuantBlock]
     :return: input and output data
     """
     device = next(model.parameters()).device
+    cache_device_name = str(getattr(config, 'reconstruction_cache_device', 'cuda')).lower()
+    if cache_device_name not in ('cpu', 'cuda'):
+        raise ValueError(
+            "reconstruction_cache_device must be either 'cpu' or 'cuda', "
+            f"got {cache_device_name!r}"
+        )
+    cache_device = torch.device('cpu') if cache_device_name == 'cpu' else device
     get_in_out = GetLayerInOut(model, layer, model_type=model_type, previous_layer_quantized=True)
     cached_batches = []
     cached_inps, cached_outs = None, None
@@ -433,10 +488,10 @@ def save_in_out_data(model: QuantModel, layer: Union[QuantLayer, BaseQuantBlock]
                             tmp_list = None
                         else:
                             for shape, indices in shape_to_indices.items():
-                                tmp_list.append(torch.cat([cached_batches[indice][0][i] for indice in indices]).to(device))
+                                tmp_list.append(torch.cat([cached_batches[indice][0][i] for indice in indices]))
                     cached_inps.append(tmp_list)
                 for shape, indices in shape_to_indices.items():
-                    cached_outs.append(torch.cat([cached_batches[indice][1] for indice in indices]).to(device))
+                    cached_outs.append(torch.cat([cached_batches[indice][1] for indice in indices]))
                 
                 # import ipdb; ipdb.set_trace()
                 
@@ -475,27 +530,27 @@ def save_in_out_data(model: QuantModel, layer: Union[QuantLayer, BaseQuantBlock]
         logger.info(f"out shape: {cached_outs.shape}")
     torch.cuda.empty_cache()
 
-    # INFO: move data to gpu, why does it need to move to cpu at first?
-    if isinstance(cached_inps, list):
-        if isinstance(cached_inps[0], list):
-            pass
-        else:
-            if len(cached_inps)==7:
-                cached_inps[0] = cached_inps[0].to(device)
-                cached_inps[2] = cached_inps[2].to(device)
-            elif len(cached_inps)==3:
-                cached_inps[0] = cached_inps[0].to(device)
-                cached_inps[1] = cached_inps[1].to(device)
-                cached_inps[2] = cached_inps[2].to(device)
-            else:
-                cached_inps[0] = cached_inps[0].to(device)
-                cached_inps[1] = cached_inps[1].to(device)
-    else:
-        cached_inps = cached_inps.to(device)
-    if isinstance(cached_outs, list):
-        pass
-    else:
-        cached_outs = cached_outs.to(device)
+    # Keep the complete reconstruction cache on the configured device.  CPU
+    # caching avoids holding several GiB of immutable calibration tensors on
+    # the GPU; block_reconstruction moves only the selected mini-batch back to
+    # the model device.  A recursive move is required for OpenSora's nested
+    # per-shape cache, including list-valued attention metadata.
+    def move_cache(value):
+        if torch.is_tensor(value):
+            return value.to(cache_device)
+        if isinstance(value, list):
+            return [move_cache(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(move_cache(item) for item in value)
+        if isinstance(value, dict):
+            return {key: move_cache(item) for key, item in value.items()}
+        return value
+
+    cached_inps = move_cache(cached_inps)
+    cached_outs = move_cache(cached_outs)
+    if cache_device.type == 'cpu':
+        torch.cuda.empty_cache()
+    logger.info("Reconstruction cache device: %s", cache_device)
 
     return cached_inps, cached_outs
 

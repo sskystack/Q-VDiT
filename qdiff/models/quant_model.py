@@ -8,6 +8,7 @@ from qdiff.models.stdit_quant_layer import QuantSpatialAttnLinear, QuantTemporal
 from qdiff.models.dit_quant_layer import QuantAttnLinearImg, QuantCrossAttnLinearImg
 from qdiff.models.quant_block import BaseQuantBlock, TransformerBlock, QuantTransformerBlock, get_specials
 from qdiff.quantizer.base_quantizer import StraightThrough, BaseQuantizer, WeightQuantizer, ActQuantizer
+from qdiff.reconstruction_checkpoint import inference_quant_params_state
 
 logger = logging.getLogger(__name__)
 
@@ -253,6 +254,13 @@ class QuantModel(nn.Module):
                 self.get_quant_params_dict(module=module_, prefix=full_name+'.')
 
         return self.quant_params_dict
+
+
+    def get_inference_quant_params_dict(self, dtype=torch.float32):
+        """Return a CPU checkpoint directly loadable by quantized inference."""
+        return inference_quant_params_state(
+            self.get_quant_params_dict(dtype=dtype), dtype=dtype
+        )
 
 
     def set_quant_params_dict(self, quant_params_dict, module=None, load_buffer_only=True, dtype=torch.float32):

@@ -85,6 +85,12 @@ class IDDPM(SpacedDiffusion):
                     model_args['y'] = model_args['y'][choose_idx,:].permute([1,0,2,3,4]).reshape([len(choose_idx)*text_embeds_shape[1],\
                         text_embeds_shape[2],text_embeds_shape[3],text_embeds_shape[4]])
                     model_args['mask'] = model_args['mask'][choose_idx,:]
+
+                # Precomputed text embeddings are loaded on CPU by default. Move
+                # conditioning tensors alongside the latent before the first model
+                # forward and match the model compute dtype for FlashAttention.
+                model_args['y'] = model_args['y'].to(device=device, dtype=z.dtype)
+                model_args['mask'] = model_args['mask'].to(device=device)
             else:
                 model_args = text_encoder.encode(prompts)
                 y_null = text_encoder.null(n)
@@ -161,6 +167,21 @@ def forward_with_cfg(model, x, timestep, y, cfg_scale, return_trajectory=False, 
         model_output_uncond = model.forward(half, t_uncond, y_uncond, **kwargs)
 
         model_out = torch.cat([model_output_cond, model_output_uncond], dim=0)
+        if getattr(model, "mtd_profile_enabled", False):
+            from qdiff.mtd_feature_profiler import capture_paired_cfg_outputs
+
+            capture_paired_cfg_outputs(
+                model=model,
+                latent=half,
+                t_cond=t_cond,
+                t_uncond=t_uncond,
+                y_cond=y_cond,
+                y_uncond=y_uncond,
+                model_kwargs=kwargs,
+                quant_cond=model_output_cond,
+                quant_uncond=model_output_uncond,
+                cfg_scale=cfg_scale,
+            )
     else:
         half = x[: len(x) // 2] # actually use the 1st half of x
         combined = torch.cat([half, half], dim=0)

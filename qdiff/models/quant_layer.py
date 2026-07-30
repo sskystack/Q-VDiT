@@ -21,6 +21,23 @@ def find_interval(timerange, timestep_id):
 
 linear_dtype = torch.float32
 
+
+def cast_linear_operands(input, weight, bias=None):
+    """Cast temporary compute tensors without changing FP32 trainable masters.
+
+    TQE keeps its LoRA parameters in FP32 for stable reconstruction, while the
+    STDiT hidden states may run in BF16/FP16 for FlashAttention.  Casting the
+    effective weight here preserves FP32 optimizer state and guarantees that
+    every linear/conv kernel receives matching input, weight, and bias dtypes.
+    Gradients still flow through the differentiable dtype conversion.
+    """
+    if torch.is_floating_point(input):
+        if weight.dtype != input.dtype:
+            weight = weight.to(input.dtype)
+        if bias is not None and bias.dtype != input.dtype:
+            bias = bias.to(input.dtype)
+    return weight, bias
+
 class QuantLayer(nn.Module):
     """
     Quantized Module that can perform quantized convolution or normal convolution.
@@ -204,10 +221,7 @@ class QuantLayer(nn.Module):
             bias = self.bias
 
 
-        if weight.dtype == torch.float32 and input.dtype == torch.float16:
-            weight = weight.to(torch.float16)
-
-
+        weight, bias = cast_linear_operands(input, weight, bias)
         out = self.fwd_func(input, weight, bias, **self.fwd_kwargs)  # 在输出的channel上进行channel_wise的量化
         out = self.activation_function(out)
 
