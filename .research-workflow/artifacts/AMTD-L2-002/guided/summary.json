@@ -1,0 +1,104 @@
+{
+  "profile_dir": "/home/zhouchongtian/quantization/qvdit_flash_bf16/logs_fp16_flash/adaptive_mtd_feature_capture_v1/features",
+  "captures": 9,
+  "teacher_key": "fp_guided_pooled",
+  "student_key": "quant_guided_pooled",
+  "config": {
+    "search_radius": 2,
+    "topk": 9,
+    "temperature": 0.07,
+    "seed": 42
+  },
+  "mass_outside_fixed_3x3": 0.6100047826766968,
+  "top1_outside_fixed_3x3_rate": 0.6099826097488403,
+  "schemes": {
+    "fixed_3x3": {
+      "local_kl": 0.10110465437173843,
+      "motion_error": 0.004905626643449068,
+      "displacement_error": 0.13594640791416168,
+      "teacher_entropy": 0.41943496465682983,
+      "teacher_normalized_entropy": 0.19912385940551758,
+      "teacher_mass_covered": 0.38999515771865845,
+      "teacher_top1_retained": 0.3900173604488373,
+      "candidate_count": 8.265625
+    },
+    "teacher_topk": {
+      "local_kl": 0.12509605288505554,
+      "motion_error": 0.003166975686326623,
+      "displacement_error": 0.26603999733924866,
+      "teacher_entropy": 0.8040496706962585,
+      "teacher_normalized_entropy": 0.3659387528896332,
+      "teacher_mass_covered": 0.999636709690094,
+      "teacher_top1_retained": 1.0,
+      "candidate_count": 9.0
+    },
+    "teacher_centered_3x3": {
+      "local_kl": 0.06810180097818375,
+      "motion_error": 0.0030496548861265182,
+      "displacement_error": 0.07932804524898529,
+      "teacher_entropy": 0.3622985780239105,
+      "teacher_normalized_entropy": 0.17003461718559265,
+      "teacher_mass_covered": 0.7753309607505798,
+      "teacher_top1_retained": 1.0,
+      "candidate_count": 8.406973838806152
+    },
+    "random_topk": {
+      "local_kl": 0.11007051169872284,
+      "motion_error": 0.005075995344668627,
+      "displacement_error": 0.22577187418937683,
+      "teacher_entropy": 0.4491206407546997,
+      "teacher_normalized_entropy": 0.2044036090373993,
+      "teacher_mass_covered": 0.4453922510147095,
+      "teacher_top1_retained": 0.44409722089767456,
+      "candidate_count": 9.0
+    }
+  },
+  "proxies": {
+    "fixed_match_confidence": {
+      "spearman": -0.4656270638526482,
+      "top_25_mass_fraction": 0.07378161698579788,
+      "top_25_lift": 0.29512646794319153,
+      "top_50_mass_fraction": 0.23434533178806305,
+      "top_50_lift": 0.4686906635761261
+    },
+    "wide_match_confidence": {
+      "spearman": -0.09564426080699931,
+      "top_25_mass_fraction": 0.24836072325706482,
+      "top_25_lift": 0.9934428930282593,
+      "top_50_mass_fraction": 0.47818395495414734,
+      "top_50_lift": 0.9563679099082947
+    },
+    "teacher_temporal_delta": {
+      "spearman": 0.03294889653452864,
+      "top_25_mass_fraction": 0.2534317970275879,
+      "top_25_lift": 1.0137271881103516,
+      "top_50_mass_fraction": 0.5129421949386597,
+      "top_50_lift": 1.0258843898773193
+    },
+    "teacher_motion_magnitude": {
+      "spearman": 0.11584352034180327,
+      "top_25_mass_fraction": 0.34594377875328064,
+      "top_25_lift": 1.3837751150131226,
+      "top_50_mass_fraction": 0.5960296988487244,
+      "top_50_lift": 1.1920593976974487
+    },
+    "fp_quant_error": {
+      "spearman": 0.3366446533632345,
+      "top_25_mass_fraction": 0.46376532316207886,
+      "top_25_lift": 1.8550612926483154,
+      "top_50_mass_fraction": 0.6898636221885681,
+      "top_50_lift": 1.3797272443771362
+    },
+    "oracle_need_score": {
+      "spearman": 0.9999999999999999,
+      "top_25_mass_fraction": 0.8270223140716553,
+      "top_25_lift": 3.308089256286621,
+      "top_50_mass_fraction": 0.9406382441520691,
+      "top_50_lift": 1.8812764883041382
+    }
+  },
+  "interpretation": {
+    "candidate_test": "The fixed 3x3 hypothesis is weakened when teacher mass/top1 often falls outside it and an equal-budget adaptive scheme reduces both student-teacher local KL and transport error.",
+    "importance_test": "A proxy is useful only when its Spearman correlation and top-k loss mass lift exceed the random-area expectation."
+  }
+}

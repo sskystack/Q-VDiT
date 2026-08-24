@@ -1,0 +1,3 @@
+id,timestamp,type,experiment_ids,artifact,artifact_hash,validation,external_status,external_score_or_review,notes
+TF-DELIV-001,2026-07-31,profiler,"TF-SMOKE-001;TF-MTD-001;TF-BASE-001",tools/profile_temporal_frequency_tqe.py,33fbd78345413ee09cf9daa175dcabd714947901653e294e824ca4aeaad6bf5c,validated-negative,not-applicable,NA,"Exact-forward paired DC/AC profiler"
+TF-DELIV-002,2026-07-31,report,"TF-MTD-001;TF-BASE-001",.research-workflow/temporal-frequency-tqe-report.md,NA,validated-negative,not-applicable,NA,"Frozen hypothesis falsified"
