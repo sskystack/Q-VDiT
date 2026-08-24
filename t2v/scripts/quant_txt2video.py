@@ -135,7 +135,12 @@ def main():
     if PRECOMPUTE_TEXT_EMBEDS is not None:
         text_encoder = None
     else:
-        text_encoder = build_module(cfg.text_encoder, MODELS, device=device)  # T5 must be fp32
+        text_encoder = build_module(
+            cfg.text_encoder,
+            MODELS,
+            device=device,
+            dtype=torch.float32,
+        )
         text_encoder.y_embedder = model.y_embedder  # hack for classifier-free guidance
 
     # 3.3. move to device & eval
@@ -366,12 +371,6 @@ def main():
                     f"prompt_index={original_index}"
                 )
             for _ in range(skipped_prompts):
-                torch.randn(
-                    1,
-                    vae.out_channels,
-                    *latent_size,
-                    device=device,
-                )
                 for _ in range(num_sampling_timesteps):
                     torch.randn(
                         2,
@@ -379,7 +378,15 @@ def main():
                         *latent_size,
                         device=device,
                     )
-            init_noise = None
+            noise_generator = torch.Generator(device=device)
+            noise_generator.manual_seed(int(cfg.seed) + original_index)
+            init_noise = torch.randn(
+                1,
+                vae.out_channels,
+                *latent_size,
+                device=device,
+                generator=noise_generator,
+            )
             replay_cursor = original_index + 1
         elif requested_prompt_indices:
             per_prompt_noise = []

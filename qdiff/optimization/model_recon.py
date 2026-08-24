@@ -14,7 +14,16 @@ from opensora.models.stdit.modules import Mlp
 logger = logging.getLogger(__name__)
 
 
-def our_model_reconstruction(model, module, calib_data, config, param_types, opt_target, prefix=""):
+def our_model_reconstruction(
+    model,
+    module,
+    calib_data,
+    config,
+    param_types,
+    opt_target,
+    prefix="",
+    mtd_v2_schedule=None,
+):
     # INFO: due to that the layer_reconstruct and block_reconstruct need to feed in the **quantized_whole_model**
     # while the model is used for recursively conduct reconstruction
     # names = []
@@ -23,5 +32,13 @@ def our_model_reconstruction(model, module, calib_data, config, param_types, opt
         # names.append(name)
         # modules.append(module)
 
-    block_reconstruction(model, module, calib_data, config, param_types, opt_target)
+    block_reconstruction(
+        model,
+        module,
+        calib_data,
+        config,
+        param_types,
+        opt_target,
+        mtd_v2_schedule=mtd_v2_schedule,
+    )
     return

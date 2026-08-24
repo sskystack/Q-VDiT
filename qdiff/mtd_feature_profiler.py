@@ -1,5 +1,6 @@
 """Paired FP/quant feature capture for Motion Transport Distillation profiling."""
 
+import hashlib
 import json
 import os
 import re
@@ -36,9 +37,14 @@ def _restore_quant_states(states):
         module.set_quant_state(*state)
 
 
-def _safe_name(value):
+def _safe_name(value, max_length=120):
     value = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
-    return value.strip("_") or "prompt"
+    value = value.strip("_") or "prompt"
+    if len(value) > max_length:
+        digest = hashlib.sha1(value.encode("utf-8")).hexdigest()[:10]
+        prefix = value[: max_length - len(digest) - 1].rstrip("_")
+        value = f"{prefix}_{digest}"
+    return value
 
 
 def _cpu_feature(tensor):

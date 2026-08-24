@@ -21,6 +21,7 @@ from qdiff.models.quant_model import QuantModel
 from qdiff.quantizer.base_quantizer import BaseQuantizer, WeightQuantizer, ActQuantizer
 from qdiff.utils import get_quant_calib_data
 from qdiff.optimization.model_recon import our_model_reconstruction
+from qdiff.mtd import build_mtd_v2_schedule_context, normalize_mtd_v2_config
 from qdiff.memory_profile import (
     configure_memory_profiler,
     finish_memory_profiler,
@@ -115,6 +116,13 @@ def main():
     # 3. build model & load weights
     # ======================================================
     scheduler = build_module(cfg.scheduler, SCHEDULERS)
+    mtd_v2_schedule = None
+    if normalize_mtd_v2_config(config).get('enabled'):
+        mtd_v2_schedule = build_mtd_v2_schedule_context(scheduler)
+        logger.info(
+            "Enabled MTD-v2 with exact IDDPM scheduler signature %s",
+            mtd_v2_schedule['signature'],
+        )
     # 3.2. build model
     input_size = (cfg.num_frames, *cfg.image_size)
     vae = build_module(cfg.vae, MODELS)
@@ -134,7 +142,12 @@ def main():
     if PRECOMPUTE_TEXT_EMBEDS is not None:
         text_encoder = None
     else:
-        text_encoder = build_module(cfg.text_encoder, MODELS, device=device)  # T5 must be fp32
+        text_encoder = build_module(
+            cfg.text_encoder,
+            MODELS,
+            device=device,
+            dtype=torch.float32,
+        )
         text_encoder.y_embedder = model.y_embedder  # hack for classifier-free guidance
     # 3.3. move to device & eval
     vae = vae.to(device, dtype).eval()
@@ -435,6 +448,7 @@ def main():
         torch.cuda.empty_cache()
         mark_memory("activation_quantizer_initialized", qnn=qnn)
 
+
         # Read-only paired probes on the exact same calibration mini-batch.
         # Reconstruction below disables activation quantization, while formal
         # inference enables dynamic A6.  Measuring FP -> W4 -> W4A6 here makes
@@ -517,7 +531,15 @@ def main():
                 assert config.quant.weight.quantizer.round_mode == 'learned_hard_sigmoid'  # check adaround stat
             mark_memory("reconstruction_start", qnn=qnn, calib_data=calib_data)
             set_calib_numeric_phase("reconstruction_cache_and_optimization")
-            our_model_reconstruction(qnn,qnn,calib_data,config,param_types,opt_target)  # DEBUG_ONLY
+            our_model_reconstruction(
+                qnn,
+                qnn,
+                calib_data,
+                config,
+                param_types,
+                opt_target,
+                mtd_v2_schedule=mtd_v2_schedule,
+            )  # DEBUG_ONLY
             mark_memory("reconstruction_complete", qnn=qnn, calib_data=calib_data)
             logger.info("Finished optimizing param {} for layer's {}, saving temporary checkpoint...".format(param_types, opt_target))
             torch.save(

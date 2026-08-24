@@ -153,9 +153,10 @@ def parse_args(training=False, mode=None):
             action="store_true",
             help=(
                 "for non-contiguous prompt_indices, reproduce the original full-run "
-                "global CUDA RNG stream by consuming the skipped prompts' DDIM "
-                "random draws without evaluating the model; requires batch_size=1 "
-                "and strictly increasing prompt indices"
+                "global CUDA RNG stream by consuming the skipped prompts' DDIM-step "
+                "random draws without evaluating the model; initial noise is rebuilt "
+                "from seed + original prompt index; requires batch_size=1 and "
+                "strictly increasing prompt indices"
             ),
         )
         parser.add_argument(

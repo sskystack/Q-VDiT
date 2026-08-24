@@ -77,7 +77,12 @@ def main():
     if PRECOMPUTE_TEXT_EMBEDS is not None:
         text_encoder = None
     else:
-        text_encoder = build_module(cfg.text_encoder, MODELS, device=device)  # T5 must be fp32
+        text_encoder = build_module(
+            cfg.text_encoder,
+            MODELS,
+            device=device,
+            dtype=torch.float32,
+        )
         text_encoder.y_embedder = model.y_embedder  # hack for classifier-free guidance
 
     # 3.3. move to device & eval

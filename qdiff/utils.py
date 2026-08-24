@@ -1,4 +1,7 @@
 import logging
+import hashlib
+import math
+import time
 from typing import Union
 import numpy as np
 from tqdm import trange
@@ -11,9 +14,141 @@ from qdiff.models.quant_layer import QuantLayer
 from qdiff.models.quant_block import BaseQuantBlock
 from qdiff.models.quant_model import QuantModel
 from qdiff.quantizer.base_quantizer import BaseQuantizer, lp_loss
-from qdiff.mtd import motion_transport_distillation, normalize_mtd_config
+from qdiff.mtd import (
+    motion_transport_distillation,
+    motion_transport_distillation_v2,
+    normalize_mtd_config,
+    normalize_mtd_v2_config,
+)
 
 logger = logging.getLogger(__name__)
+
+
+class SemanticMTDCollector:
+    """Collect reduced CFG and temporal-attention maps from one paired FP pass."""
+
+    def __init__(self, model, attention_chunk_size):
+        stdit = getattr(model, "model", None)
+        if stdit is None or not hasattr(stdit, "blocks"):
+            raise ValueError("semantic MTD collection requires an OpenSora STDiT model")
+        if getattr(stdit, "enable_sequence_parallelism", False):
+            raise ValueError("semantic MTD collection does not support sequence parallelism")
+        self.stdit = stdit
+        self.attention_chunk_size = int(attention_chunk_size)
+        self.pair_count = 0
+        self.handles = []
+        self.temporal_by_block = {}
+        self.cfg_sum = None
+        self.temporal_sum = None
+        self.block_count = 0
+
+    def _spatial_map(self, values):
+        spatial_tokens = values.shape[-1]
+        side = math.isqrt(spatial_tokens)
+        if side * side != spatial_tokens:
+            raise ValueError(
+                f"semantic MTD expected square spatial tokens, got {spatial_tokens}"
+            )
+        return values.reshape(self.pair_count, -1, side, side)
+
+    def _attention_callback(self, block_index, incoming):
+        total_batch = 2 * self.pair_count
+        spatial_tokens = incoming.shape[0] // total_batch
+        if incoming.shape[0] != total_batch * spatial_tokens:
+            raise ValueError("temporal attention batch cannot be split into CFG pairs")
+        temporal = incoming.reshape(
+            total_batch, spatial_tokens, incoming.shape[-1]
+        ).permute(0, 2, 1)
+        self.temporal_by_block[block_index] = self._spatial_map(
+            temporal[: self.pair_count].detach().float()
+        )
+
+    def _block_hook(self, block_index, module, inputs, output):
+        del module, inputs
+        if block_index not in self.temporal_by_block:
+            raise RuntimeError(
+                f"missing temporal attention statistics for STDiT block {block_index}"
+            )
+        if not torch.is_tensor(output) or output.shape[0] != 2 * self.pair_count:
+            raise ValueError("STDiT block output does not match paired CFG layout")
+        conditional = output[: self.pair_count].detach()
+        unconditional = output[self.pair_count :].detach()
+        cfg_chunks = []
+        for start in range(0, output.shape[1], 1024):
+            difference = (
+                conditional[:, start : start + 1024].float()
+                - unconditional[:, start : start + 1024].float()
+            )
+            cfg_chunks.append(difference.square().mean(dim=-1).sqrt())
+        cfg = torch.cat(cfg_chunks, dim=1)
+        cfg = cfg.reshape(self.pair_count, self.stdit.num_temporal, -1)
+        cfg = self._spatial_map(cfg)
+        temporal = self.temporal_by_block.pop(block_index)
+        self.cfg_sum = cfg if self.cfg_sum is None else self.cfg_sum + cfg
+        self.temporal_sum = (
+            temporal if self.temporal_sum is None else self.temporal_sum + temporal
+        )
+        self.block_count += 1
+
+    def start(self, pair_count):
+        self.pair_count = int(pair_count)
+        self.temporal_by_block = {}
+        self.cfg_sum = None
+        self.temporal_sum = None
+        self.block_count = 0
+        self.handles = []
+        for index, block in enumerate(self.stdit.blocks):
+            block.attn_temp.set_incoming_attention_callback(
+                lambda incoming, index=index: self._attention_callback(index, incoming),
+                chunk_size=self.attention_chunk_size,
+            )
+            self.handles.append(
+                block.register_forward_hook(
+                    lambda module, inputs, output, index=index: self._block_hook(
+                        index, module, inputs, output
+                    )
+                )
+            )
+
+    def finish(self):
+        for handle in self.handles:
+            handle.remove()
+        for block in self.stdit.blocks:
+            block.attn_temp.set_incoming_attention_callback(None)
+        self.handles = []
+        if self.temporal_by_block:
+            raise RuntimeError("unconsumed temporal attention statistics remain")
+        if self.block_count != len(self.stdit.blocks):
+            raise RuntimeError(
+                f"collected {self.block_count} STDiT blocks, expected "
+                f"{len(self.stdit.blocks)}"
+            )
+        return (
+            self.cfg_sum.div(self.block_count).cpu(),
+            self.temporal_sum.div(self.block_count).cpu(),
+        )
+
+    def abort(self):
+        for handle in self.handles:
+            handle.remove()
+        for block in self.stdit.blocks:
+            block.attn_temp.set_incoming_attention_callback(None)
+        self.handles = []
+
+
+def _robust_unit_interval(values, low_percentile, high_percentile, eps):
+    flat = values.float().flatten()
+    low = torch.quantile(flat, low_percentile / 100.0)
+    high = torch.quantile(flat, high_percentile / 100.0)
+    normalized = ((values.float() - low) / (high - low + eps)).clamp(0.0, 1.0)
+    return normalized, float(low), float(high)
+
+
+def _interleaved_cfg_pair_indices(step_start, pair_start, pair_count):
+    """Return cond/uncond indices for [cond_0, uncond_0, ...] cache rows."""
+    pair_ids = torch.arange(pair_start, pair_start + pair_count, dtype=torch.long)
+    cond_indices = int(step_start) + 2 * pair_ids
+    return cond_indices, cond_indices + 1
 
 def get_quant_calib_data(config, sample_data, custom_steps=None, model_type='opensora', repeat_interleave=False):
     num_samples, num_st = config.calib_data.n_samples, custom_steps
@@ -141,6 +276,7 @@ class LossFunction:
                  use_reconstruction_loss=False,
                  use_round_loss=False,
                  mtd_config=None,
+                 mtd_v2_schedule=None,
                  ):
 
         self.module = module
@@ -155,12 +291,22 @@ class LossFunction:
         self.use_reconstruction_loss = use_reconstruction_loss
         self.use_round_loss = use_round_loss
         self.mtd_config = normalize_mtd_config(mtd_config)
+        self.mtd_v2_config = normalize_mtd_v2_config(mtd_config)
+        self.mtd_v2_schedule = mtd_v2_schedule
 
         self.temp_decay = LinearTempDecay(iters, rel_start_decay=warmup + (1 - warmup) * decay_start,
                                           start_b=b_range[0], end_b=b_range[1])
         self.count = 0
 
-    def __call__(self, pred, tgt, grad=None):
+    def __call__(
+        self,
+        pred,
+        tgt,
+        grad=None,
+        mtd_importance=None,
+        mtd_fine_scores=None,
+        mtd_v2_context=None,
+    ):
         """
         Compute the total loss for adaptive rounding:
         reconstruction_loss is the quadratic output reconstruction loss, round_loss is
@@ -182,18 +328,20 @@ class LossFunction:
             grad = grad.float()
 
         total_loss = 0.
+        reconstruction_base = pred.new_zeros(())
+        relation_loss_time = pred.new_zeros(())
+        relation_loss_weighted = pred.new_zeros(())
 
         self.count += 1
         if self.use_reconstruction_loss:
             if self.reconstruction_loss_type == 'mse':
-                reconstruction_loss = lp_loss(pred, tgt, p=int(self.p), reduction='all')
+                reconstruction_base = lp_loss(pred, tgt, p=int(self.p), reduction='all')
+                reconstruction_loss = reconstruction_base
             elif self.reconstruction_loss_type == 'relation':
-                reconstruction_loss = lp_loss(pred, tgt, p=int(self.p), reduction='all')
-                # pred shape [2*batch, n_frame, 64, 64]
-                # print('reco loss:', reconstruction_loss)
+                reconstruction_base = lp_loss(pred, tgt, p=int(self.p), reduction='all')
                 relation_loss_time =  get_time_relation_loss(pred, tgt)
-                # print('relation loss:', relation_loss_time)
-                reconstruction_loss += relation_loss_time * 100
+                relation_loss_weighted = relation_loss_time * 100.0
+                reconstruction_loss = reconstruction_base + relation_loss_weighted
             elif self.reconstruction_loss_type == 'fisher_diag':
                 reconstruction_loss = ((pred - tgt).pow(2) * grad.pow(2)).sum(1).mean()
             elif self.reconstruction_loss_type == 'fisher_full':
@@ -206,8 +354,29 @@ class LossFunction:
         else:
             reconstruction_loss = 0.
 
-        mtd_loss, mtd_terms = motion_transport_distillation(
-            pred, tgt, self.mtd_config, return_components=True
+        call_mtd_config = dict(self.mtd_config)
+        call_mtd_config["iteration"] = self.count
+        mtd_loss, mtd_terms, mtd_diagnostics = motion_transport_distillation(
+            pred,
+            tgt,
+            call_mtd_config,
+            return_components=True,
+            return_diagnostics=True,
+            importance_weights=mtd_importance,
+            fine_selection_scores=mtd_fine_scores,
+        )
+        if mtd_v2_context is not None:
+            mtd_v2_context = dict(mtd_v2_context)
+            mtd_v2_context["schedule"] = self.mtd_v2_schedule
+        mtd_v2_loss, mtd_v2_terms, mtd_v2_diagnostics = (
+            motion_transport_distillation_v2(
+                pred,
+                tgt,
+                context=mtd_v2_context,
+                config=self.mtd_v2_config,
+                return_components=True,
+                return_diagnostics=True,
+            )
         )
 
         b = self.temp_decay(self.count)
@@ -234,38 +403,82 @@ class LossFunction:
         total_loss += reconstruction_loss
         total_loss += round_loss
         total_loss += mtd_loss
+        total_loss += mtd_v2_loss
         # Keep graph-connected component tensors available to diagnostics in
         # the reconstruction loop.  They are cleared immediately after the
         # backward pass there, so this does not retain graphs across steps.
         self.last_component_tensors = {
             'reconstruction': reconstruction_loss,
+            'reconstruction_base': reconstruction_base,
+            'official_tmd_raw': relation_loss_time,
+            'official_tmd_weighted': relation_loss_weighted,
             'mtd': mtd_loss,
             'mtd_local': mtd_terms['local'],
             'mtd_motion': mtd_terms['motion'],
             'mtd_global': mtd_terms['global'],
+            'mtd_fine': mtd_terms['fine'],
+            'mtd_v2': mtd_v2_loss,
+            'mtd_v2_correspondence': mtd_v2_terms['correspondence'],
+            'mtd_v2_flow': mtd_v2_terms['flow'],
+            'mtd_v2_global': mtd_v2_terms['global'],
             'round': round_loss,
             'total': total_loss,
         }
         self.last_components = {
             'reconstruction': float(reconstruction_loss),
+            'reconstruction_base': float(reconstruction_base),
+            'official_tmd_raw': float(relation_loss_time),
+            'official_tmd_weighted': float(relation_loss_weighted),
             'mtd': float(mtd_loss),
             'mtd_local': float(mtd_terms['local']),
             'mtd_motion': float(mtd_terms['motion']),
             'mtd_global': float(mtd_terms['global']),
+            'mtd_fine': float(mtd_terms['fine']),
+            'mtd_v2': float(mtd_v2_loss),
+            'mtd_v2_correspondence': float(mtd_v2_terms['correspondence']),
+            'mtd_v2_flow': float(mtd_v2_terms['flow']),
+            'mtd_v2_global': float(mtd_v2_terms['global']),
             'round': float(round_loss),
             'total': float(total_loss),
         }
+        self.last_mtd_diagnostics = {}
+        for name, value in mtd_diagnostics.items():
+            if torch.is_tensor(value):
+                detached = value.detach().cpu()
+                converted = (
+                    float(detached) if detached.numel() == 1
+                    else detached.tolist()
+                )
+            else:
+                converted = value
+            self.last_mtd_diagnostics[name] = converted
+            self.last_components[f'mtd_{name}'] = converted
+        for name, value in mtd_v2_diagnostics.items():
+            if torch.is_tensor(value):
+                detached = value.detach().cpu()
+                converted = (
+                    float(detached) if detached.numel() == 1
+                    else detached.tolist()
+                )
+            else:
+                converted = value
+            self.last_mtd_diagnostics[f'v2_{name}'] = converted
+            self.last_components[f'mtd_v2_{name}'] = converted
         if self.count == 1 or self.count % 100 == 0:
             reconstruction_loss = -1 if not self.use_reconstruction_loss else reconstruction_loss
             round_loss = -1 if not self.use_round_loss else round_loss
             logger.info(
                 'Total loss:\t{:.6f} '
                 '(rec:{:.6f}, mtd:{:.6f} [local:{:.6f}, motion:{:.6f}, '
-                'global:{:.6f}], round:{:.6})'
+                'global:{:.6f}, fine:{:.6f}], mtd_v2:{:.6f} '
+                '[corr:{:.6f}, flow:{:.6f}, global:{:.6f}], round:{:.6})'
                 '\tb={:.2f}\tcount={}'.format(
                     float(total_loss), float(reconstruction_loss), float(mtd_loss),
                     float(mtd_terms['local']), float(mtd_terms['motion']),
                     float(mtd_terms['global']),
+                    float(mtd_terms['fine']),
+                    float(mtd_v2_loss), float(mtd_v2_terms['correspondence']),
+                    float(mtd_v2_terms['flow']), float(mtd_v2_terms['global']),
                     float(round_loss), b, self.count
                 )
             )
@@ -312,8 +525,170 @@ def prepare_coco_text_and_image(json_file):
         image_paths.append("/share/public/diffusion_quant/coco/coco/val2014/"+f"COCO_val2014_{image_id:012}.jpg")
     return active_captions, image_paths
 
+def _save_semantic_reconstruction_cache(
+    model,
+    layer,
+    calib_data,
+    config,
+    cache_device,
+    mtd_config,
+):
+    if layer is not model or config.model.model_type != "opensora":
+        raise ValueError("semantic MTD cache collection requires whole-model OpenSora reconstruction")
+    calib_xs, calib_ts, calib_conds, calib_masks = calib_data
+    samples_per_step = int(config.calib_data.n_samples)
+    group_size = 2 * samples_per_step
+    total_items = int(calib_xs.shape[0])
+    if total_items % group_size:
+        raise ValueError(
+            "semantic MTD calibration data must contain cond/uncond groups of "
+            f"{group_size}, got {total_items} items"
+        )
+
+    collector = SemanticMTDCollector(
+        model,
+        attention_chunk_size=mtd_config["attention_chunk_size"],
+    )
+    get_in_out = GetLayerInOut(
+        model,
+        layer,
+        model_type="opensora",
+        previous_layer_quantized=True,
+        semantic_collector=collector,
+    )
+    cached_outs = None
+    cached_xs = torch.empty_like(calib_xs)
+    cached_ts = torch.empty_like(calib_ts)
+    raw_cfg = None
+    raw_temporal = None
+    pair_batch_size = mtd_config["semantic_pair_batch_size"]
+    start_time = time.perf_counter()
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats(device=next(model.parameters()).device)
+
+    for step_start in trange(0, total_items, group_size):
+        for pair_start in range(0, samples_per_step, pair_batch_size):
+            pair_count = min(pair_batch_size, samples_per_step - pair_start)
+            cond_indices, uncond_indices = _interleaved_cfg_pair_indices(
+                step_start, pair_start, pair_count
+            )
+            if not torch.equal(
+                calib_ts.index_select(0, cond_indices),
+                calib_ts.index_select(0, uncond_indices),
+            ):
+                raise ValueError("semantic MTD CFG pair timesteps do not match")
+
+            # The calibration artifact stores an independent second latent
+            # half, but CFG inference duplicates the first half before the
+            # conditional/unconditional forwards.  Use that same effective
+            # input here so the hidden-state difference isolates text.
+            paired_x = calib_xs.index_select(0, cond_indices)
+            paired_t = calib_ts.index_select(0, cond_indices)
+            indices = torch.cat([cond_indices, uncond_indices])
+            paired_x = torch.cat([paired_x, paired_x])
+            paired_t = torch.cat([paired_t, paired_t])
+            device = next(model.parameters()).device
+            _, cur_out = get_in_out(
+                paired_x.to(device),
+                paired_t.to(device),
+                calib_conds.index_select(0, indices).to(device),
+                {},
+                calib_masks.index_select(0, indices).to(device),
+                semantic_pair_count=pair_count,
+            )
+            cfg_map, temporal_map = get_in_out.semantic_store
+            if cached_outs is None:
+                cached_outs = torch.empty(
+                    total_items, *cur_out.shape[1:], dtype=cur_out.dtype
+                )
+                raw_cfg = torch.empty(
+                    total_items, *cfg_map.shape[1:], dtype=torch.float32
+                )
+                raw_temporal = torch.empty_like(raw_cfg)
+            cached_outs.index_copy_(0, indices, cur_out.detach().cpu())
+            cached_xs.index_copy_(0, indices, paired_x)
+            cached_ts.index_copy_(0, indices, paired_t)
+            raw_cfg.index_copy_(0, cond_indices, cfg_map)
+            raw_cfg.index_copy_(0, uncond_indices, cfg_map)
+            raw_temporal.index_copy_(0, cond_indices, temporal_map)
+            raw_temporal.index_copy_(0, uncond_indices, temporal_map)
+
+    low = mtd_config["semantic_percentile_low"]
+    high = mtd_config["semantic_percentile_high"]
+    eps = mtd_config["importance_eps"]
+    normalized_cfg, cfg_low, cfg_high = _robust_unit_interval(
+        raw_cfg, low, high, eps
+    )
+    normalized_temporal, temporal_low, temporal_high = _robust_unit_interval(
+        raw_temporal, low, high, eps
+    )
+    native_product = normalized_cfg * normalized_temporal
+
+    def resize_scores(scores, size):
+        batch, frames, height, width = scores.shape
+        resized = F.adaptive_avg_pool2d(
+            scores.reshape(batch * frames, 1, height, width),
+            (size, size),
+        )
+        return resized.reshape(batch, frames, size, size)
+
+    coarse_product = resize_scores(native_product, mtd_config["transport_size"])
+    importance = (
+        mtd_config["weight_min"]
+        + (mtd_config["weight_max"] - mtd_config["weight_min"])
+        * coarse_product
+    )
+    importance = importance[:, :-1].flatten(2).contiguous()
+    fine_scores = resize_scores(
+        native_product, mtd_config["fine_transport_size"]
+    )[:, :-1].flatten(2).contiguous()
+    importance_hash = hashlib.sha256(importance.numpy().tobytes()).hexdigest()
+    fine_score_hash = hashlib.sha256(fine_scores.numpy().tobytes()).hexdigest()
+    elapsed = time.perf_counter() - start_time
+    peak_memory = (
+        int(torch.cuda.max_memory_allocated(device=next(model.parameters()).device))
+        if torch.cuda.is_available()
+        else 0
+    )
+    statistics = {
+        "cfg_p_low": cfg_low,
+        "cfg_p_high": cfg_high,
+        "temporal_p_low": temporal_low,
+        "temporal_p_high": temporal_high,
+        "weight_min_observed": float(importance.min()),
+        "weight_max_observed": float(importance.max()),
+        "importance_hash": importance_hash,
+        "fine_score_min_observed": float(fine_scores.min()),
+        "fine_score_max_observed": float(fine_scores.max()),
+        "fine_score_hash": fine_score_hash,
+        "cfg_pair_layout": "interleaved_cond_uncond",
+        "cfg_pair_latent_policy": "duplicate_conditional_latent",
+    }
+    logger.info(
+        "Semantic MTD cache: time=%.2fs peak_memory=%d MiB "
+        "cfg_p=(%.6g, %.6g) temporal_p=(%.6g, %.6g) weights=(%.4f, %.4f)",
+        elapsed,
+        peak_memory // (1024 * 1024),
+        cfg_low,
+        cfg_high,
+        temporal_low,
+        temporal_high,
+        statistics["weight_min_observed"],
+        statistics["weight_max_observed"],
+    )
+    cached_inps = [cached_xs, cached_ts, calib_conds]
+    cached_inps = [value.to(cache_device) for value in cached_inps]
+    return (
+        cached_inps,
+        cached_outs.to(cache_device),
+        importance.to(cache_device),
+        fine_scores.to(cache_device),
+        statistics,
+    )
+
+
 # ---------- save input output activation & grad ---------------------
-def save_in_out_data(model: QuantModel, layer: Union[QuantLayer, BaseQuantBlock], calib_data: torch.Tensor, config, model_type='sdxl', split_save_attn=False):
+def save_in_out_data(model: QuantModel, layer: Union[QuantLayer, BaseQuantBlock], calib_data: torch.Tensor, config, model_type='sdxl', split_save_attn=False, collect_mtd_importance=False):
     # asym: bool = False, act_quant: bool = False, batch_size: int = 32, keep_gpu: bool = True,
                       # cond: bool = True, split_save_attn: bool = False, model_type='sdxl'):
     """
@@ -338,6 +713,13 @@ def save_in_out_data(model: QuantModel, layer: Union[QuantLayer, BaseQuantBlock]
             f"got {cache_device_name!r}"
         )
     cache_device = torch.device('cpu') if cache_device_name == 'cpu' else device
+    mtd_config = normalize_mtd_config(config)
+    if collect_mtd_importance:
+        if not mtd_config["semantic_importance"]:
+            raise ValueError("collect_mtd_importance requires semantic_importance")
+        return _save_semantic_reconstruction_cache(
+            model, layer, calib_data, config, cache_device, mtd_config
+        )
     get_in_out = GetLayerInOut(model, layer, model_type=model_type, previous_layer_quantized=True)
     cached_batches = []
     cached_inps, cached_outs = None, None
@@ -617,17 +999,19 @@ class DataSaverHook:
 
 
 class GetLayerInOut:
-    def __init__(self, model: QuantModel, layer: Union[QuantLayer, BaseQuantBlock], model_type='sd', previous_layer_quantized=False):
+    def __init__(self, model: QuantModel, layer: Union[QuantLayer, BaseQuantBlock], model_type='sd', previous_layer_quantized=False, semantic_collector=None):
                  # device: torch.device, asym: bool = False, act_quant: bool = False, model_type='sd'):
         self.model = model
         self.layer = layer
         self.previous_layer_quantized = previous_layer_quantized
+        self.semantic_collector = semantic_collector
+        self.semantic_store = None
         # self.device = device
         # self.act_quant = act_quant
         self.model_type = model_type
         self.data_saver = DataSaverHook(store_input=True, store_output=True, stop_forward=True)
 
-    def __call__(self, x, timesteps, context=None, added_conds=None, mask=None):
+    def __call__(self, x, timesteps, context=None, added_conds=None, mask=None, semantic_pair_count=None):
 
         self.model.eval()  # temporarily use eval mode
         # INFO: save the quant_state, since it will be written by (False, False)
@@ -650,13 +1034,19 @@ class GetLayerInOut:
             else:
                 tmp_kwargs = {}
 
+            if self.semantic_collector is not None:
+                self.semantic_collector.start(semantic_pair_count)
             try:
-                if self.model_type == 'opensora':
-                    _ = self.model(x, timesteps, context, mask=mask, **tmp_kwargs)
-                else:
-                    _ = self.model(x, timesteps, context, added_cond_kwargs=added_conds, mask=mask, **tmp_kwargs)
-            except StopForwardException:
-                pass
+                try:
+                    if self.model_type == 'opensora':
+                        _ = self.model(x, timesteps, context, mask=mask, **tmp_kwargs)
+                    else:
+                        _ = self.model(x, timesteps, context, added_cond_kwargs=added_conds, mask=mask, **tmp_kwargs)
+                except StopForwardException:
+                    pass
+            finally:
+                if self.semantic_collector is not None:
+                    self.semantic_store = self.semantic_collector.finish()
 
             if self.previous_layer_quantized:
                 # INFO: rewrite the input data, with *all previous layer* quantized

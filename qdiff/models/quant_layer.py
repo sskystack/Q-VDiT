@@ -1,4 +1,5 @@
 import logging
+import os
 import warnings
 import torch
 import torch.nn as nn
@@ -72,7 +73,11 @@ class QuantLayer(nn.Module):
         self.r = 32
         self.loraA = nn.Linear(org_module.in_features, self.r, bias=False, dtype=linear_dtype)
         self.loraB = nn.Linear(self.r, org_module.out_features, bias=False, dtype=linear_dtype)
-        self.r_out = 1
+        # Keep rank-1 as the released default while allowing controlled
+        # rank ablations to run concurrently in separate processes/GPUs.
+        self.r_out = int(os.environ.get("QVDIT_TQE_RANK", "1"))
+        if self.r_out <= 0:
+            raise ValueError("QVDIT_TQE_RANK must be a positive integer")
         self.loraA_out = nn.Linear(org_module.in_features, self.r_out, bias=False, dtype=linear_dtype)
         self.loraB_out = nn.Linear(self.r_out, org_module.out_features, bias=False, dtype=linear_dtype)
         nn.init.kaiming_uniform_(self.loraA.weight, a=math.sqrt(5))

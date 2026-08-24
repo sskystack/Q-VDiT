@@ -15,7 +15,7 @@ from qdiff.models.quant_block import BaseQuantBlock
 from qdiff.quantizer.base_quantizer import StraightThrough
 # from qdiff.quantizer.base_quantizer import AdaRoundQuantizer
 from qdiff.utils import save_grad_data, save_in_out_data, LossFunction
-from qdiff.mtd import normalize_mtd_config, normalize_mtd_v2_config
+from qdiff.mtd import normalize_mtd_config
 from qdiff.reconstruction_checkpoint import (
     atomic_torch_save,
     nested_tensors_to_cpu,
@@ -538,176 +538,6 @@ def _run_loss_component_gradient_probe(
     )
 
 
-def _run_mtd_v2_gradient_probe(
-    block,
-    loss_func,
-    iteration,
-    grad_scale,
-    output_path,
-):
-    """Record independently scaled MTD-v2 component gradient norms."""
-    components = getattr(loss_func, "last_component_tensors", {})
-    names = (
-        "reconstruction",
-        "mtd_v2_correspondence",
-        "mtd_v2_flow",
-        "mtd_v2_global",
-    )
-    tensors = {name: components.get(name) for name in names}
-    if not all(torch.is_tensor(value) and value.requires_grad for value in tensors.values()):
-        logger.warning(
-            "Skipping MTD-v2 gradient probe at iteration %d: loss components are unavailable",
-            iteration,
-        )
-        return False
-    named_parameters = [
-        (name, parameter)
-        for name, parameter in block.named_parameters()
-        if parameter.requires_grad
-    ]
-    parameters = [parameter for _, parameter in named_parameters]
-    scale = max(float(grad_scale), 1.0)
-
-    def gradients_for(component):
-        for parameter in parameters:
-            parameter.grad = None
-        (component * scale).backward(retain_graph=True)
-        gradients = tuple(
-            None if parameter.grad is None
-            else parameter.grad.detach().float().clone() / scale
-            for parameter in parameters
-        )
-        for parameter in parameters:
-            parameter.grad = None
-        return gradients
-
-    statistics = {
-        name: _component_gradient_statistics(
-            named_parameters, gradients_for(tensors[name])
-        )
-        for name in names
-    }
-    rec_norm = statistics["reconstruction"][0]
-    record = {
-        "iteration": int(iteration),
-        "loss": {name: float(tensors[name].detach()) for name in names},
-        "gradient": {
-            name: {
-                "norm": statistics[name][0],
-                "ratio_to_reconstruction": statistics[name][0] / max(rec_norm, 1.0e-30),
-                "categories": statistics[name][1],
-            }
-            for name in names
-        },
-    }
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    with open(output_path, "a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record, ensure_ascii=False, allow_nan=True) + "\n")
-    logger.info(
-        "MTD-v2 gradient probe iteration=%d corr=%.6e flow=%.6e global=%.6e",
-        iteration,
-        statistics["mtd_v2_correspondence"][0],
-        statistics["mtd_v2_flow"][0],
-        statistics["mtd_v2_global"][0],
-    )
-    return True
-
-
-def _run_official_tmd_gradient_probe(
-    block,
-    loss_func,
-    iteration,
-    grad_scale,
-    output_path,
-):
-    """Compare the official temporal-relation term against plain reconstruction."""
-    components = getattr(loss_func, "last_component_tensors", {})
-    names = ("reconstruction_base", "official_tmd_raw", "official_tmd_weighted")
-    tensors = {name: components.get(name) for name in names}
-    if not all(torch.is_tensor(value) and value.requires_grad for value in tensors.values()):
-        return False
-
-    named_parameters = [
-        (name, parameter)
-        for name, parameter in block.named_parameters()
-        if parameter.requires_grad
-    ]
-    parameters = [parameter for _, parameter in named_parameters]
-    scale = max(float(grad_scale), 1.0)
-
-    def gradients_for(component):
-        for parameter in parameters:
-            parameter.grad = None
-        (component * scale).backward(retain_graph=True)
-        gradients = tuple(
-            None if parameter.grad is None
-            else parameter.grad.detach().float().clone() / scale
-            for parameter in parameters
-        )
-        for parameter in parameters:
-            parameter.grad = None
-        return gradients
-
-    gradients = {name: gradients_for(tensors[name]) for name in names}
-    statistics = {
-        name: _component_gradient_statistics(named_parameters, values)
-        for name, values in gradients.items()
-    }
-    rec_norm, rec_categories, rec_by_name = statistics["reconstruction_base"]
-
-    def relation_record(name):
-        norm, categories, by_name = statistics[name]
-        dot = 0.0
-        for parameter_name, _ in named_parameters:
-            rec_value = rec_by_name.get(parameter_name)
-            value = by_name.get(parameter_name)
-            if rec_value is not None and value is not None:
-                dot += float(rec_value.flatten() @ value.flatten())
-        return {
-            "loss": float(tensors[name].detach()),
-            "grad_norm": norm,
-            "ratio_to_rec": norm / max(rec_norm, 1.0e-30),
-            "dot_with_rec": dot,
-            "cosine_with_rec": dot / max(rec_norm * norm, 1.0e-30),
-            "categories": categories,
-        }
-
-    raw = relation_record("official_tmd_raw")
-    weighted = relation_record("official_tmd_weighted")
-    record = {
-        "iteration": int(iteration),
-        "coefficient": 100.0,
-        "reconstruction": {
-            "loss": float(tensors["reconstruction_base"].detach()),
-            "grad_norm": rec_norm,
-            "categories": rec_categories,
-        },
-        "tmd_raw": raw,
-        "tmd_weighted": weighted,
-        "combined_loss": float(
-            (tensors["reconstruction_base"] + tensors["official_tmd_weighted"]).detach()
-        ),
-        "scale_used": scale,
-    }
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    with open(output_path, "a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record, ensure_ascii=False, allow_nan=True) + "\n")
-    logger.info(
-        "Official TMD probe iteration=%d rec_loss=%.6e raw_tmd=%.6e "
-        "weighted_tmd=%.6e rec_grad=%.6e weighted_tmd_grad=%.6e "
-        "ratio=%.4f cosine=%.4f",
-        iteration,
-        record["reconstruction"]["loss"],
-        raw["loss"],
-        weighted["loss"],
-        rec_norm,
-        weighted["grad_norm"],
-        weighted["ratio_to_rec"],
-        weighted["cosine_with_rec"],
-    )
-    return True
-
-
 def mv_to_gpu(l_x, device='cuda'):
     if l_x is None:
         pass
@@ -726,15 +556,7 @@ def mv_to_gpu(l_x, device='cuda'):
     return l_x
 
 
-def block_reconstruction(
-    model: QuantModel,
-    block: BaseQuantBlock,
-    calib_data: torch.Tensor,
-    config,
-    param_types,
-    opt_target,
-    mtd_v2_schedule=None,
-):
+def block_reconstruction(model: QuantModel, block: BaseQuantBlock, calib_data: torch.Tensor, config, param_types, opt_target):
                          # batch_size: int = 32, iters: int = 20000, weight: float = 0.01, opt_mode: str = 'mse',
                          # asym: bool = False, include_act_func: bool = True, b_range: tuple = (20, 2),
                          # warmup: float = 0.0, act_quant: bool = False, lr: float = 4e-5, p: float = 2.0,
@@ -763,43 +585,17 @@ def block_reconstruction(
 
     device = model.device
     batch_size = config.calib_data.batch_size
-    mtd_config = normalize_mtd_config(config)
-    mtd_v2_config = normalize_mtd_v2_config(config)
-    if mtd_v2_config['enabled'] and mtd_v2_schedule is None:
-        raise ValueError(
-            "MTD-v2 requires exact scheduler coefficients from the calibration entrypoint"
-        )
     mark_memory("reconstruction_cache_start", model=model, calib_data=calib_data)
 
     if len(calib_data)==4:
         if config.model.model_type == 'pixart' or config.model.model_type == 'opensora':
-            cache_result = save_in_out_data(
-                model,
-                block,
-                calib_data,
-                config,
-                model_type=config.model.model_type,
-                collect_mtd_importance=mtd_config["semantic_importance"],
-            )
+            cached_inps, cached_outs = save_in_out_data(model, block, calib_data, config, model_type=config.model.model_type)
         else:
             assert config.model.model_type == 'sdxl'
-            cache_result = save_in_out_data(model, block, calib_data, config, model_type='sdxl')
+            cached_inps, cached_outs = save_in_out_data(model, block, calib_data, config, model_type='sdxl')
     else:
         assert config.model.model_type == 'sd'
-        cache_result = save_in_out_data(model, block, calib_data, config, model_type='sd')
-    if mtd_config["semantic_importance"]:
-        (
-            cached_inps,
-            cached_outs,
-            cached_mtd_importance,
-            cached_mtd_fine_scores,
-            semantic_statistics,
-        ) = cache_result
-    else:
-        cached_inps, cached_outs = cache_result
-        cached_mtd_importance = None
-        cached_mtd_fine_scores = None
-        semantic_statistics = {}
+        cached_inps, cached_outs = save_in_out_data(model, block, calib_data, config, model_type='sd')
     mark_memory("reconstruction_cache_complete", model=model, cached_inps=cached_inps, cached_outs=cached_outs)
     # cached_inps = mv_to_gpu(cached_inps, device=device)
     # cached_outs = mv_to_gpu(cached_outs, device=device)
@@ -946,71 +742,29 @@ def block_reconstruction(
     if opt_target == 'weight_and_activation':
         logging.info("When joint optimization, use weight's quant config")
         config_loss = config.quant.weight.optimization.loss
-        loss_iters = config.quant.weight.optimization.iters
+        config_loss['iters'] = config.quant.weight.optimization.iters
     else:
         config_loss = getattr(config.quant, opt_target).optimization.loss
-        loss_iters = getattr(config.quant, opt_target).optimization.iters
-    # OmegaConf accepts scalar loss options but rejects scheduler tensors.  The
-    # loss wrapper owns this short-lived mapping, so detach it from the global
-    # config before adding the exact MTD-v2 scheduler context.
-    config_loss = dict(config_loss)
-    config_loss['iters'] = loss_iters
+        config_loss['iters'] = getattr(config.quant, opt_target).optimization.iters
     config_loss['iters'] = config_loss['iters']*0.9  # INFO: anneal to minimum value with 0.7 iters
     config_loss['module_type'] = 'block'
     config_loss['use_reconstruction_loss'] = ('delta' in param_types or 'delta_out' in param_types)
     config_loss['use_round_loss'] = 'alpha' in param_types
     config_loss['mtd_config'] = config
-    config_loss['mtd_v2_schedule'] = mtd_v2_schedule
     loss_func = LossFunction(block, **config_loss)
 
-    mtd_v2_signature = dict(mtd_v2_config)
-    mtd_v2_signature['temporal_offsets'] = list(
-        mtd_v2_signature['temporal_offsets']
-    )
-
+    mtd_config = normalize_mtd_config(config)
     reconstruction_signature = {
         'mtd_enabled': mtd_config['enabled'],
         'noise_channels': mtd_config['noise_channels'],
         'transport_size': mtd_config['transport_size'],
         'temperature': mtd_config['temperature'],
+        'search_mode': mtd_config['search_mode'],
+        'anchor_radius': mtd_config['anchor_radius'],
         'total_weight': mtd_config['total_weight'],
         'local_transport_weight': mtd_config['local_transport_weight'],
         'motion_residual_weight': mtd_config['motion_residual_weight'],
         'global_relation_weight': mtd_config['global_relation_weight'],
-        'fine_enabled': mtd_config['fine_enabled'],
-        'fine_weight': mtd_config['fine_weight'],
-        'fine_transport_size': mtd_config['fine_transport_size'],
-        'fine_kernel_size': mtd_config['fine_kernel_size'],
-        'fine_selection': mtd_config['fine_selection'],
-        'key_region_ratio': mtd_config['key_region_ratio'],
-        'key_region_block_size': mtd_config['key_region_block_size'],
-        'fine_selection_seed': mtd_config['fine_selection_seed'],
-        'candidate_mode': mtd_config['candidate_mode'],
-        'spatial_weighting': mtd_config['spatial_weighting'],
-        'search_radius': mtd_config['search_radius'],
-        'topk': mtd_config['topk'],
-        'random_seed': mtd_config['random_seed'],
-        'importance_eps': mtd_config['importance_eps'],
-        'semantic_weighting': mtd_config['semantic_weighting'],
-        'weight_min': mtd_config['weight_min'],
-        'weight_max': mtd_config['weight_max'],
-        'semantic_percentile_low': mtd_config['semantic_percentile_low'],
-        'semantic_percentile_high': mtd_config['semantic_percentile_high'],
-        'semantic_pair_batch_size': mtd_config['semantic_pair_batch_size'],
-        'attention_chunk_size': mtd_config['attention_chunk_size'],
-        'semantic_importance': mtd_config['semantic_importance'],
-        'fine_motion_weight': mtd_config['fine_motion_weight'],
-        'mtd_v2_enabled': mtd_v2_config['enabled'],
-        'mtd_v2_config': mtd_v2_signature,
-        'mtd_v2_scheduler_signature': (
-            mtd_v2_schedule.get('signature') if mtd_v2_schedule else None
-        ),
-        'mtd_v2_implementation_version': (
-            'mtd_v2_epsilon_transport_ablation_v1'
-            if mtd_v2_config['feature_source'] == 'epsilon'
-            else 'mtd_v2_x0_multiscale_v1'
-        ),
-        'semantic_statistics': semantic_statistics,
         'batch_size': int(config.calib_data.batch_size),
         'n_steps': int(config.calib_data.n_steps),
         'n_samples': int(config.calib_data.n_samples),
@@ -1076,38 +830,8 @@ def block_reconstruction(
         # Backward compatibility for checkpoints created before total_weight
         # was introduced; their effective global MTD weight was 1.0.
         saved_signature.setdefault('total_weight', 1.0)
-        saved_signature.setdefault('fine_enabled', False)
-        saved_signature.setdefault('fine_weight', 0.0)
-        saved_signature.setdefault('fine_transport_size', 32)
-        saved_signature.setdefault('fine_kernel_size', 5)
-        saved_signature.setdefault('fine_selection', 'error')
-        saved_signature.setdefault('key_region_ratio', 0.25)
-        saved_signature.setdefault('key_region_block_size', 4)
-        saved_signature.setdefault('fine_selection_seed', 42)
-        saved_signature.setdefault('semantic_weighting', False)
-        saved_signature.setdefault('weight_min', 0.5)
-        saved_signature.setdefault('weight_max', 1.5)
-        saved_signature.setdefault('semantic_percentile_low', 1.0)
-        saved_signature.setdefault('semantic_percentile_high', 99.0)
-        saved_signature.setdefault('semantic_pair_batch_size', 2)
-        saved_signature.setdefault('attention_chunk_size', 256)
-        saved_signature.setdefault('semantic_importance', False)
-        saved_signature.setdefault('fine_motion_weight', 1.0)
-        saved_signature.setdefault('semantic_statistics', {})
-        saved_signature.setdefault('mtd_v2_enabled', False)
-        saved_signature.setdefault('mtd_v2_config', mtd_v2_signature)
-        # Checkpoints written before teacher cycle gating existed are exactly
-        # equivalent to the new implementation with the gate disabled.
-        saved_mtd_v2_config = saved_signature.get('mtd_v2_config')
-        if isinstance(saved_mtd_v2_config, dict):
-            saved_mtd_v2_config.setdefault('feature_source', 'x0')
-            saved_mtd_v2_config.setdefault('cycle_enabled', False)
-            saved_mtd_v2_config.setdefault('cycle_min', 0.05)
-            saved_mtd_v2_config.setdefault('cycle_power', 1.0)
-        saved_signature.setdefault('mtd_v2_scheduler_signature', None)
-        saved_signature.setdefault(
-            'mtd_v2_implementation_version', 'mtd_v2_x0_multiscale_v1'
-        )
+        saved_signature.setdefault('search_mode', 'fixed_3x3')
+        saved_signature.setdefault('anchor_radius', 4)
         if saved_signature != reconstruction_signature:
             raise ValueError(
                 "Reconstruction checkpoint MTD/calibration signature does not match the config"
@@ -1265,28 +989,7 @@ def block_reconstruction(
             )
         else:
             cur_out = _select_to_device(cached_outs, idx, device)
-        cur_mtd_importance = (
-            _select_to_device(cached_mtd_importance, idx, device)
-            if cached_mtd_importance is not None
-            else None
-        )
-        cur_mtd_fine_scores = (
-            _select_to_device(cached_mtd_fine_scores, idx, device)
-            if cached_mtd_fine_scores is not None
-            else None
-        )
         cur_grad = _select_to_device(cached_grads, idx, device) if use_grad else None
-        if mtd_v2_config['enabled']:
-            if not isinstance(cur_inp, (tuple, list)) or len(cur_inp) < 2:
-                raise ValueError(
-                    "MTD-v2 requires cached OpenSora inputs (x_t, timesteps, ...)."
-                )
-            cur_mtd_v2_context = {
-                'x_t': cur_inp[0],
-                'timesteps': cur_inp[1],
-            }
-        else:
-            cur_mtd_v2_context = None
 
         # import ipdb; ipdb.set_trace()
         optimizer.zero_grad()
@@ -1298,14 +1001,7 @@ def block_reconstruction(
         # t2 = time.time()
         # logger.info('infer time {}'.format(t2 - t1))
         # import ipdb; ipdb.set_trace()
-        err = loss_func(
-            out_quant,
-            cur_out,
-            cur_grad,
-            mtd_importance=cur_mtd_importance,
-            mtd_fine_scores=cur_mtd_fine_scores,
-            mtd_v2_context=cur_mtd_v2_context,
-        )
+        err = loss_func(out_quant, cur_out, cur_grad)
         # t3 = time.time()
         # logger.info('loss time {}'.format(t3 - t2))
         # check nan
@@ -1330,30 +1026,15 @@ def block_reconstruction(
             )
         )
         if should_component_probe:
-            probe_scale = scaler.get_scale() if use_grad_scaler else 1.0
-            if mtd_v2_config['enabled']:
-                _run_mtd_v2_gradient_probe(
-                    block,
-                    loss_func,
-                    completed_iterations,
-                    probe_scale,
-                    os.path.join(checkpoint_dir, "mtd_v2_gradients.jsonl"),
-                )
-            else:
-                official_tmd_probed = _run_official_tmd_gradient_probe(
-                    block, loss_func, completed_iterations, probe_scale,
-                    os.path.join(checkpoint_dir, "official_tmd_gradients.jsonl"),
-                )
-                if not official_tmd_probed:
-                    _run_loss_component_gradient_probe(
-                        block=block,
-                        loss_func=loss_func,
-                        iteration=completed_iterations,
-                        grad_scale=probe_scale,
-                        output_path=os.path.join(
-                            checkpoint_dir, "loss_component_gradients.jsonl"
-                        ),
-                    )
+            _run_loss_component_gradient_probe(
+                block=block,
+                loss_func=loss_func,
+                iteration=completed_iterations,
+                grad_scale=(scaler.get_scale() if use_grad_scaler else 1.0),
+                output_path=os.path.join(
+                    checkpoint_dir, "loss_component_gradients.jsonl"
+                ),
+            )
         if use_grad_scaler:
             scaler.scale(err).backward()
             scaler.unscale_(optimizer)

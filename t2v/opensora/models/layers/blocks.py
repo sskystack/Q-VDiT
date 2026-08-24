@@ -27,6 +27,29 @@ from opensora.acceleration.parallel_states import get_sequence_parallel_group
 approx_gelu = lambda: nn.GELU(approximate="tanh")
 
 
+def temporal_attention_incoming_mass(
+    q,
+    k,
+    scale,
+    flash_layout=True,
+    chunk_size=256,
+):
+    """Return mean-head incoming attention mass without retaining attention."""
+    if chunk_size <= 0:
+        raise ValueError("temporal attention chunk_size must be positive")
+    if not flash_layout:
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+    incoming = []
+    for start in range(0, q.shape[0], chunk_size):
+        q_chunk = q[start : start + chunk_size].detach().float()
+        k_chunk = k[start : start + chunk_size].detach().float()
+        logits = torch.einsum("bqhd,bkhd->bhqk", q_chunk, k_chunk)
+        probabilities = (logits * float(scale)).softmax(dim=-1)
+        incoming.append(probabilities.sum(dim=-2).mean(dim=1))
+    return torch.cat(incoming, dim=0)
+
+
 def get_layernorm(hidden_size: torch.Tensor, eps: float, affine: bool, use_kernel: bool):
     if use_kernel:
         try:
@@ -147,6 +170,15 @@ class Attention(nn.Module):
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
+        self._incoming_attention_callback = None
+        self._incoming_attention_chunk_size = 256
+
+    def set_incoming_attention_callback(self, callback=None, chunk_size=256):
+        """Enable reduced temporal-attention statistics during calibration."""
+        if chunk_size <= 0:
+            raise ValueError("incoming attention chunk_size must be positive")
+        self._incoming_attention_callback = callback
+        self._incoming_attention_chunk_size = int(chunk_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, N, C = x.shape
@@ -167,6 +199,16 @@ class Attention(nn.Module):
         q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)
         if self.enable_flashattn:
+            if self._incoming_attention_callback is not None:
+                self._incoming_attention_callback(
+                    temporal_attention_incoming_mass(
+                        q,
+                        k,
+                        self.scale,
+                        flash_layout=True,
+                        chunk_size=self._incoming_attention_chunk_size,
+                    )
+                )
             from flash_attn import flash_attn_func
 
             x = flash_attn_func(
@@ -182,6 +224,10 @@ class Attention(nn.Module):
             attn = q @ k.transpose(-2, -1)  # translate attn to float32
             attn = attn.to(torch.float32)
             attn = attn.softmax(dim=-1)
+            if self._incoming_attention_callback is not None:
+                self._incoming_attention_callback(
+                    attn.detach().sum(dim=-2).mean(dim=1)
+                )
             attn = attn.to(dtype)  # cast back attn to original dtype
             attn = self.attn_drop(attn)
             x = attn @ v
