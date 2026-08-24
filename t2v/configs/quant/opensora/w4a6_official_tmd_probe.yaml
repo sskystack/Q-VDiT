@@ -5,28 +5,11 @@ model:
 conditional: true
 cfg_split: true
 noise_channels: 4
-# Keep the full immutable reconstruction cache in host memory.  Each sampled
-# mini-batch is transferred to the model device immediately before forward.
-reconstruction_cache_device: "cpu"
 method:
   token_axis: "TQE"
-  frame_axis: "MTD"
+  frame_axis: "BASELINE"
   diffusion_axis: "NONE"
-mtd:
-  total_weight: 1.0
-  transport_size: 16
-  temperature: 0.07
-  local_transport_weight: 1.0
-  motion_residual_weight: 1.0
-  global_relation_weight: 0.1
-  semantic_importance: false
-  semantic_weighting: false
-  weight_min: 0.5
-  weight_max: 1.5
-  semantic_percentile_low: 1.0
-  semantic_percentile_high: 99.0
-  semantic_pair_batch_size: 2
-  attention_chunk_size: 256
+component_gradient_probe_iterations: [1, 100, 1000, 10000]
 calib_data:
   path: "your path of calib data"
   n_steps: 50
@@ -42,6 +25,7 @@ quant:
       loss:
         lambda_coeff: 0.5
         warmup: 0.0
+        reconstruction_loss_type: "relation"
       params:
         delta:
           lr: 1.e-6

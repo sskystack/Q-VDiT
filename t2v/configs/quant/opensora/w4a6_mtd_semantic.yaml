@@ -5,8 +5,6 @@ model:
 conditional: true
 cfg_split: true
 noise_channels: 4
-# Keep the full immutable reconstruction cache in host memory.  Each sampled
-# mini-batch is transferred to the model device immediately before forward.
 reconstruction_cache_device: "cpu"
 method:
   token_axis: "TQE"
@@ -19,8 +17,8 @@ mtd:
   local_transport_weight: 1.0
   motion_residual_weight: 1.0
   global_relation_weight: 0.1
-  semantic_importance: false
-  semantic_weighting: false
+  semantic_importance: true
+  semantic_weighting: true
   weight_min: 0.5
   weight_max: 1.5
   semantic_percentile_low: 1.0
