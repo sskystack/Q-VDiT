@@ -14,6 +14,7 @@ import yaml
 from mmengine.config import Config
 from mmengine.runner import set_random_seed
 
+from opensora.registry import MODELS, build_module
 from opensora.schedulers.iddpm import forward_with_cfg
 from opensora.utils.misc import to_torch_dtype
 from tools.profile_stage_numeric_mechanism import build_quant_model, prepare_conditioning, set_quant_mode
@@ -24,13 +25,29 @@ def parse_args():
     parser.add_argument("--config", required=True)
     parser.add_argument("--calib-config", required=True)
     parser.add_argument("--quant-ckpt", required=True)
-    parser.add_argument("--text-embeds", required=True)
+    parser.add_argument("--text-embeds")
     parser.add_argument("--prompt-index", type=int, default=0)
+    parser.add_argument("--prompt-text", default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--time-mp-config-weight", required=True)
     parser.add_argument("--time-mp-config-act", required=True)
     parser.add_argument("--output-dir", required=True)
     return parser.parse_args()
+
+
+def encode_prompt(cfg, qnn, prompt, device, dtype):
+    if not prompt:
+        raise ValueError("--prompt-text is required when --text-embeds is omitted")
+    text_encoder = build_module(cfg.text_encoder, MODELS, device=device)
+    text_encoder.y_embedder = qnn.model.y_embedder
+    encoded = text_encoder.encode([prompt])
+    conditioning = {
+        "y": torch.cat([encoded["y"], text_encoder.null(1)], dim=0).to(device=device, dtype=dtype),
+        "mask": encoded["mask"].to(device=device),
+    }
+    del text_encoder
+    torch.cuda.empty_cache()
+    return conditioning
 
 
 def metrics(value, reference):
@@ -89,7 +106,12 @@ def main():
     torch.set_grad_enabled(False)
 
     scheduler, latent_size, qnn = build_quant_model(args, cfg, device, dtype)
-    conditioning = prepare_conditioning(args.text_embeds, args.prompt_index, device, dtype)
+    if args.text_embeds:
+        conditioning = prepare_conditioning(args.text_embeds, args.prompt_index, device, dtype)
+        conditioning_source = "precomputed_embedding"
+    else:
+        conditioning = encode_prompt(cfg, qnn, args.prompt_text, device, dtype)
+        conditioning_source = "online_t5"
     generator = torch.Generator(device=device).manual_seed(args.seed)
     init_noise = torch.randn(1, qnn.in_channels, *latent_size, device=device, generator=generator)
     z = torch.cat([init_noise, init_noise], dim=0)
@@ -108,6 +130,9 @@ def main():
         "calibration_config": str(Path(args.calib_config).resolve()),
         "model_checkpoint": str(Path(cfg.model.from_pretrained).resolve()),
         "prompt_index": args.prompt_index,
+        "prompt_text": args.prompt_text,
+        "conditioning_source": conditioning_source,
+        "text_embeddings": str(Path(args.text_embeds).resolve()) if args.text_embeds else None,
         "seed": args.seed,
         "gpu_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "runtime_dtype": str(dtype),
